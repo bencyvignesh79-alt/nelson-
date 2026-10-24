@@ -1,0 +1,67 @@
+# Rust
+target/
+**/*.rs.bk
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Docker
+Dockerfile*
+docker-compose*
+.dockerignore
+
+# Documentation
+README.md
+*.md
+docs/
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+
+# Environment
+.env*
+!.env.example
+
+# Frontend
+web/node_modules/
+web/dist/
+web/build/
+web/.svelte-kit/
+
+# Python venvs (any location)
+**/.venv/
+**/venv/
+
+# Terraform
+**/.terraform/
+
+# Python build artifacts
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.egg-info/
+**/.pytest_cache/
+**/.coverage
+**/htmlcov/
+**/.mypy_cache/
+**/.ruff_cache/
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+benchmarks/data
+benchmarks/benchmarks

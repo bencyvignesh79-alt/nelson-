@@ -1,0 +1,108 @@
+# Benchmark overlay — layers on top of the base docker-compose.yml
+# Does NOT require docker-compose.dev.yml
+#
+# Usage (with GPU for embeddings):
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.benchmark.yml -f docker/docker-compose.gpu.yml --env-file .env up -d --build
+#
+# Usage (without GPU — will be slow):
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.benchmark.yml --env-file .env up -d --build
+#
+# Starts: postgres, redis, migrator, searcher, indexer, ai, embeddings
+# Connectors, web, and caddy are disabled via profiles.
+
+x-benchmark-db: &benchmark-db
+  DATABASE_HOST: postgres
+  DATABASE_PORT: 5432
+  DATABASE_USERNAME: omni_bench
+  DATABASE_PASSWORD: omni_bench_password
+  DATABASE_NAME: omni_benchmark
+
+services:
+  postgres:
+    container_name: omni-postgres-benchmark
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_benchmark_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: omni_benchmark
+      POSTGRES_USER: omni_bench
+      POSTGRES_PASSWORD: omni_bench_password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U omni_bench -d omni_benchmark"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    container_name: omni-redis-benchmark
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_benchmark_data:/data
+
+  migrator:
+    image: omni-migrator:bench
+    build:
+      context: ..
+      dockerfile: services/migrations/Dockerfile
+    environment:
+      <<: *benchmark-db
+
+  searcher:
+    image: omni-searcher:bench
+    build:
+      context: ..
+      dockerfile: services/searcher/Dockerfile
+    ports:
+      - "${SEARCHER_PORT}:${SEARCHER_PORT}"
+    environment:
+      <<: *benchmark-db
+
+  indexer:
+    image: omni-indexer:bench
+    build:
+      context: ..
+      dockerfile: services/indexer/Dockerfile
+    ports:
+      - "${INDEXER_PORT}:${INDEXER_PORT}"
+    environment:
+      <<: *benchmark-db
+      RUST_LOG: info
+
+  ai:
+    image: omni-ai:bench
+    build:
+      context: ../services/ai
+      dockerfile: Dockerfile
+    ports:
+      - "${AI_SERVICE_PORT}:${AI_SERVICE_PORT}"
+    environment:
+      <<: *benchmark-db
+
+  # Enable embeddings service (overrides profiles: [local-embeddings] from base)
+  embeddings:
+    profiles: []
+    ports:
+      - "${LOCAL_EMBEDDINGS_PORT}:${LOCAL_EMBEDDINGS_PORT}"
+
+  # Disable services not needed for benchmarks
+  # Connectors are already gated by their own profiles (google, slack, etc.)
+  # and won't start unless explicitly activated.
+  web:
+    profiles: [full]
+  connector-manager:
+    profiles: [full]
+  caddy:
+    profiles: [full]
+  docling:
+    profiles: [full]
+  sandbox:
+    profiles: [full]
+
+volumes:
+  postgres_benchmark_data:
+    name: omni-postgres-benchmark-data 
+  redis_benchmark_data:
+    name: omni-redis-benchmark-data 
+

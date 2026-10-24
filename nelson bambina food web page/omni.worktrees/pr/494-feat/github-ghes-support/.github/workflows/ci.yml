@@ -1,0 +1,765 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Change detection
+  # ---------------------------------------------------------------------------
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      is-tag: ${{ steps.check-tag.outputs.is-tag }}
+      ai: ${{ steps.filter.outputs.ai }}
+      web: ${{ steps.filter.outputs.web }}
+      searcher: ${{ steps.filter.outputs.searcher }}
+      indexer: ${{ steps.filter.outputs.indexer }}
+      connector-manager: ${{ steps.filter.outputs.connector-manager }}
+      sandbox: ${{ steps.filter.outputs.sandbox }}
+      migrator: ${{ steps.filter.outputs.migrator }}
+      google-connector: ${{ steps.filter.outputs.google-connector }}
+      slack-connector: ${{ steps.filter.outputs.slack-connector }}
+      atlassian-connector: ${{ steps.filter.outputs.atlassian-connector }}
+      github-connector: ${{ steps.filter.outputs.github-connector }}
+      microsoft-connector: ${{ steps.filter.outputs.microsoft-connector }}
+      filesystem-connector: ${{ steps.filter.outputs.filesystem-connector }}
+      fireflies-connector: ${{ steps.filter.outputs.fireflies-connector }}
+      darwinbox-connector: ${{ steps.filter.outputs.darwinbox-connector }}
+      hubspot-connector: ${{ steps.filter.outputs.hubspot-connector }}
+      salesforce-connector: ${{ steps.filter.outputs.salesforce-connector }}
+      snowflake-connector: ${{ steps.filter.outputs.snowflake-connector }}
+      google-ads-connector: ${{ steps.filter.outputs.google-ads-connector }}
+      imap-connector: ${{ steps.filter.outputs.imap-connector }}
+      notion-connector: ${{ steps.filter.outputs.notion-connector }}
+      web-connector: ${{ steps.filter.outputs.web-connector }}
+      clickup-connector: ${{ steps.filter.outputs.clickup-connector }}
+      linear-connector: ${{ steps.filter.outputs.linear-connector }}
+      nextcloud-connector: ${{ steps.filter.outputs.nextcloud-connector }}
+      paperless-connector: ${{ steps.filter.outputs.paperless-connector }}
+      windshift-connector: ${{ steps.filter.outputs.windshift-connector }}
+      docling: ${{ steps.filter.outputs.docling }}
+      deployment: ${{ steps.filter.outputs.deployment }}
+      cli: ${{ steps.filter.outputs.cli }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check if tag push
+        id: check-tag
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "is-tag=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is-tag=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Detect changed paths
+        if: steps.check-tag.outputs.is-tag != 'true'
+        id: filter
+        uses: dorny/paths-filter@v4
+        with:
+          filters: |
+            ai:
+              - 'services/ai/**'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/build-service.yml'
+            web:
+              - 'web/**'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/build-service.yml'
+            searcher:
+              - 'services/searcher/**'
+              - 'shared/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/build-service.yml'
+            indexer:
+              - 'services/indexer/**'
+              - 'shared/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/build-service.yml'
+            connector-manager:
+              - 'services/connector-manager/**'
+              - 'shared/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/build-service.yml'
+            sandbox:
+              - 'services/sandbox/**'
+              - 'shared/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/build-service.yml'
+            docling:
+              - 'services/docling/**'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/build-service.yml'
+            migrator:
+              - 'services/migrations/**'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/build-service.yml'
+            google-connector:
+              - 'connectors/google/**'
+              - 'sdk/rust/**'
+              - 'shared/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/build-connector.yml'
+            slack-connector:
+              - 'connectors/slack/**'
+              - 'sdk/rust/**'
+              - 'shared/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/build-connector.yml'
+            atlassian-connector:
+              - 'connectors/atlassian/**'
+              - 'sdk/rust/**'
+              - 'shared/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/build-connector.yml'
+            filesystem-connector:
+              - 'connectors/filesystem/**'
+              - 'sdk/rust/**'
+              - 'shared/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/build-connector.yml'
+            fireflies-connector:
+              - 'connectors/fireflies/**'
+              - 'sdk/rust/**'
+              - 'shared/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/build-connector.yml'
+            darwinbox-connector:
+              - 'connectors/darwinbox/**'
+              - 'sdk/rust/**'
+              - 'shared/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/build-connector.yml'
+            imap-connector:
+              - 'connectors/imap/**'
+              - 'sdk/rust/**'
+              - 'shared/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/build-connector.yml'
+            web-connector:
+              - 'connectors/web/**'
+              - 'sdk/rust/**'
+              - 'shared/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/build-connector.yml'
+            github-connector:
+              - 'connectors/github/**'
+              - 'sdk/python/**'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/build-connector.yml'
+            hubspot-connector:
+              - 'connectors/hubspot/**'
+              - 'sdk/python/**'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/build-connector.yml'
+            salesforce-connector:
+              - 'connectors/salesforce/**'
+              - 'sdk/python/**'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/build-connector.yml'
+            snowflake-connector:
+              - 'connectors/snowflake/**'
+              - 'sdk/python/**'
+              - 'shared/**'
+              - 'services/connector-manager/**'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/build-connector.yml'
+            microsoft-connector:
+              - 'connectors/microsoft/**'
+              - 'sdk/python/**'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/build-connector.yml'
+            google-ads-connector:
+              - 'connectors/google_ads/**'
+              - 'sdk/python/**'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/build-connector.yml'
+            notion-connector:
+              - 'connectors/notion/**'
+              - 'sdk/python/**'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/build-connector.yml'
+            clickup-connector:
+              - 'connectors/clickup/**'
+              - 'sdk/python/**'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/build-connector.yml'
+            linear-connector:
+              - 'connectors/linear/**'
+              - 'sdk/typescript/**'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/build-connector.yml'
+            nextcloud-connector:
+              - 'connectors/nextcloud/**'
+              - 'sdk/rust/**'
+              - 'shared/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/build-connector.yml'
+            paperless-connector:
+              - 'connectors/paperless/**'
+              - 'sdk/python/**'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/build-connector.yml'
+            windshift-connector:
+              - 'connectors/windshift/**'
+              - 'sdk/typescript/**'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/build-connector.yml'
+            deployment:
+              - 'docker/docker-compose.yml'
+              - 'docker/docker-compose.gpu.yml'
+              - '.env.example'
+              - 'Caddyfile'
+              - 'infra/**'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/package-deployment.yml'
+            cli:
+              - 'cli/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/build-cli.yml'
+
+  # ---------------------------------------------------------------------------
+  # Core services
+  # ---------------------------------------------------------------------------
+  build-ai:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.is-tag != 'true' && needs.detect-changes.outputs.ai == 'true'
+    uses: ./.github/workflows/build-service.yml
+    with:
+      image-name: omni-ai
+      docker-context: services/ai
+      dockerfile: services/ai/Dockerfile
+      free-disk-space: true
+    secrets: inherit
+
+  build-web:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.is-tag != 'true' && needs.detect-changes.outputs.web == 'true'
+    uses: ./.github/workflows/build-service.yml
+    with:
+      image-name: omni-web
+      docker-context: web
+      dockerfile: web/Dockerfile
+    secrets: inherit
+
+  build-searcher:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.is-tag != 'true' && needs.detect-changes.outputs.searcher == 'true'
+    uses: ./.github/workflows/build-service.yml
+    with:
+      image-name: omni-searcher
+      docker-context: .
+      dockerfile: services/searcher/Dockerfile
+    secrets: inherit
+
+  build-indexer:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.is-tag != 'true' && needs.detect-changes.outputs.indexer == 'true'
+    uses: ./.github/workflows/build-service.yml
+    with:
+      image-name: omni-indexer
+      docker-context: .
+      dockerfile: services/indexer/Dockerfile
+    secrets: inherit
+
+  build-connector-manager:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.is-tag != 'true' && needs.detect-changes.outputs.connector-manager == 'true'
+    uses: ./.github/workflows/build-service.yml
+    with:
+      image-name: omni-connector-manager
+      docker-context: .
+      dockerfile: services/connector-manager/Dockerfile
+    secrets: inherit
+
+  build-sandbox:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.is-tag != 'true' && needs.detect-changes.outputs.sandbox == 'true'
+    uses: ./.github/workflows/build-service.yml
+    with:
+      image-name: omni-sandbox
+      docker-context: .
+      dockerfile: services/sandbox/Dockerfile
+    secrets: inherit
+
+  build-docling:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.is-tag != 'true' && needs.detect-changes.outputs.docling == 'true'
+    uses: ./.github/workflows/build-service.yml
+    with:
+      image-name: omni-docling
+      docker-context: services/docling
+      dockerfile: services/docling/Dockerfile
+      build-args: DEVICE=cpu
+      free-disk-space: true
+    secrets: inherit
+
+  build-docling-cuda:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.is-tag != 'true' && needs.detect-changes.outputs.docling == 'true'
+    uses: ./.github/workflows/build-service.yml
+    with:
+      image-name: omni-docling
+      docker-context: services/docling
+      dockerfile: services/docling/Dockerfile
+      build-args: DEVICE=cuda
+      tag-suffix: -cuda
+      free-disk-space: true
+    secrets: inherit
+
+  check-migrations:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.migrator == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify migration numbering is sequential
+        run: |
+          cd services/migrations
+          # Extract numeric prefixes, sort numerically, and verify no gaps or duplicates
+          numbers=$(ls *.sql 2>/dev/null | grep -oP '^\d+' | sort -n)
+          if [ -z "$numbers" ]; then
+            echo "ERROR: No migration files found"
+            exit 1
+          fi
+
+          prev=0
+          while IFS= read -r num_raw; do
+            # Strip leading zeros for arithmetic
+            num=$((10#$num_raw))
+            expected=$((prev + 1))
+            if [ "$num" -ne "$expected" ]; then
+              echo "ERROR: Migration numbering is not sequential."
+              echo "  Expected migration number: $expected (after $prev)"
+              echo "  Found: $num_raw"
+              echo ""
+              if [ "$num" -eq "$prev" ]; then
+                echo "Duplicate migration number detected."
+              else
+                echo "Gap in migration numbers detected."
+              fi
+              echo "This usually means two PRs used the same migration number."
+              echo "Please renumber your migration and try again."
+              exit 1
+            fi
+            prev=$num
+          done <<< "$numbers"
+
+          echo "All $prev migrations are in sequential order."
+
+  build-migrator:
+    needs: [detect-changes, check-migrations]
+    if: needs.detect-changes.outputs.is-tag != 'true' && needs.detect-changes.outputs.migrator == 'true'
+    uses: ./.github/workflows/build-service.yml
+    with:
+      image-name: omni-migrator
+      docker-context: .
+      dockerfile: services/migrations/Dockerfile
+    secrets: inherit
+
+  # ---------------------------------------------------------------------------
+  # Connectors (Rust)
+  # ---------------------------------------------------------------------------
+  build-google-connector:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.is-tag != 'true' && needs.detect-changes.outputs.google-connector == 'true'
+    uses: ./.github/workflows/build-connector.yml
+    with:
+      connector-name: google
+      connector-type: rust
+    secrets: inherit
+
+  build-slack-connector:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.is-tag != 'true' && needs.detect-changes.outputs.slack-connector == 'true'
+    uses: ./.github/workflows/build-connector.yml
+    with:
+      connector-name: slack
+      connector-type: rust
+    secrets: inherit
+
+  build-atlassian-connector:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.is-tag != 'true' && needs.detect-changes.outputs.atlassian-connector == 'true'
+    uses: ./.github/workflows/build-connector.yml
+    with:
+      connector-name: atlassian
+      connector-type: rust
+    secrets: inherit
+
+  build-filesystem-connector:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.is-tag != 'true' && needs.detect-changes.outputs.filesystem-connector == 'true'
+    uses: ./.github/workflows/build-connector.yml
+    with:
+      connector-name: filesystem
+      connector-type: rust
+    secrets: inherit
+
+  build-fireflies-connector:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.is-tag != 'true' && needs.detect-changes.outputs.fireflies-connector == 'true'
+    uses: ./.github/workflows/build-connector.yml
+    with:
+      connector-name: fireflies
+      connector-type: rust
+    secrets: inherit
+
+  build-darwinbox-connector:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.is-tag != 'true' && needs.detect-changes.outputs.darwinbox-connector == 'true'
+    uses: ./.github/workflows/build-connector.yml
+    with:
+      connector-name: darwinbox
+      connector-type: rust
+    secrets: inherit
+
+  build-imap-connector:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.is-tag != 'true' && needs.detect-changes.outputs.imap-connector == 'true'
+    uses: ./.github/workflows/build-connector.yml
+    with:
+      connector-name: imap
+      connector-type: rust
+    secrets: inherit
+
+  build-web-connector:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.is-tag != 'true' && needs.detect-changes.outputs.web-connector == 'true'
+    uses: ./.github/workflows/build-connector.yml
+    with:
+      connector-name: web
+      connector-type: rust
+    secrets: inherit
+
+  build-nextcloud-connector:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.is-tag != 'true' && needs.detect-changes.outputs.nextcloud-connector == 'true'
+    uses: ./.github/workflows/build-connector.yml
+    with:
+      connector-name: nextcloud
+      connector-type: rust
+    secrets: inherit
+
+  # ---------------------------------------------------------------------------
+  # Connectors (Python)
+  # ---------------------------------------------------------------------------
+  build-github-connector:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.is-tag != 'true' && needs.detect-changes.outputs.github-connector == 'true'
+    uses: ./.github/workflows/build-connector.yml
+    with:
+      connector-name: github
+      connector-type: python
+    secrets: inherit
+
+  build-hubspot-connector:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.is-tag != 'true' && needs.detect-changes.outputs.hubspot-connector == 'true'
+    uses: ./.github/workflows/build-connector.yml
+    with:
+      connector-name: hubspot
+      connector-type: python
+    secrets: inherit
+
+  build-salesforce-connector:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.is-tag != 'true' && needs.detect-changes.outputs.salesforce-connector == 'true'
+    uses: ./.github/workflows/build-connector.yml
+    with:
+      connector-name: salesforce
+      connector-type: python
+    secrets: inherit
+
+  build-snowflake-connector:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.is-tag != 'true' && needs.detect-changes.outputs.snowflake-connector == 'true'
+    uses: ./.github/workflows/build-connector.yml
+    with:
+      connector-name: snowflake
+      connector-type: python
+    secrets: inherit
+
+  build-google-ads-connector:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.is-tag != 'true' && needs.detect-changes.outputs.google-ads-connector == 'true'
+    uses: ./.github/workflows/build-connector.yml
+    with:
+      connector-name: google_ads
+      connector-type: python
+    secrets: inherit
+
+  build-microsoft-connector:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.is-tag != 'true' && needs.detect-changes.outputs.microsoft-connector == 'true'
+    uses: ./.github/workflows/build-connector.yml
+    with:
+      connector-name: microsoft
+      connector-type: python
+    secrets: inherit
+
+  build-notion-connector:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.is-tag != 'true' && needs.detect-changes.outputs.notion-connector == 'true'
+    uses: ./.github/workflows/build-connector.yml
+    with:
+      connector-name: notion
+      connector-type: python
+    secrets: inherit
+
+  build-clickup-connector:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.is-tag != 'true' && needs.detect-changes.outputs.clickup-connector == 'true'
+    uses: ./.github/workflows/build-connector.yml
+    with:
+      connector-name: clickup
+      connector-type: python
+    secrets: inherit
+
+  build-paperless-connector:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.is-tag != 'true' && needs.detect-changes.outputs.paperless-connector == 'true'
+    uses: ./.github/workflows/build-connector.yml
+    with:
+      connector-name: paperless
+      connector-type: python
+    secrets: inherit
+
+  build-linear-connector:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.is-tag != 'true' && needs.detect-changes.outputs.linear-connector == 'true'
+    uses: ./.github/workflows/build-connector.yml
+    with:
+      connector-name: linear
+      connector-type: typescript
+    secrets: inherit
+
+  build-windshift-connector:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.is-tag != 'true' && needs.detect-changes.outputs.windshift-connector == 'true'
+    uses: ./.github/workflows/build-connector.yml
+    with:
+      connector-name: windshift
+      connector-type: typescript
+    secrets: inherit
+
+  # ---------------------------------------------------------------------------
+  # Release: build all images from scratch on tag push
+  # ---------------------------------------------------------------------------
+  release-services:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.is-tag == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image-name: omni-ai
+            docker-context: services/ai
+            dockerfile: services/ai/Dockerfile
+            free-disk-space: true
+          - image-name: omni-web
+            docker-context: web
+            dockerfile: web/Dockerfile
+            free-disk-space: false
+          - image-name: omni-searcher
+            docker-context: .
+            dockerfile: services/searcher/Dockerfile
+            free-disk-space: false
+          - image-name: omni-indexer
+            docker-context: .
+            dockerfile: services/indexer/Dockerfile
+            free-disk-space: false
+          - image-name: omni-connector-manager
+            docker-context: .
+            dockerfile: services/connector-manager/Dockerfile
+            free-disk-space: false
+          - image-name: omni-sandbox
+            docker-context: .
+            dockerfile: services/sandbox/Dockerfile
+            free-disk-space: false
+          - image-name: omni-docling
+            docker-context: services/docling
+            dockerfile: services/docling/Dockerfile
+            build-args: DEVICE=cpu
+            free-disk-space: true
+          - image-name: omni-docling
+            docker-context: services/docling
+            dockerfile: services/docling/Dockerfile
+            build-args: DEVICE=cuda
+            tag-suffix: -cuda
+            free-disk-space: true
+          - image-name: omni-migrator
+            docker-context: .
+            dockerfile: services/migrations/Dockerfile
+            free-disk-space: false
+    uses: ./.github/workflows/build-service.yml
+    with:
+      image-name: ${{ matrix.image-name }}
+      docker-context: ${{ matrix.docker-context }}
+      dockerfile: ${{ matrix.dockerfile }}
+      free-disk-space: ${{ matrix.free-disk-space }}
+      build-args: ${{ matrix.build-args }}
+      tag-suffix: ${{ matrix.tag-suffix }}
+    secrets: inherit
+
+  release-connectors:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.is-tag == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - connector-name: google
+            connector-type: rust
+          - connector-name: slack
+            connector-type: rust
+          - connector-name: atlassian
+            connector-type: rust
+          - connector-name: filesystem
+            connector-type: rust
+          - connector-name: fireflies
+            connector-type: rust
+          - connector-name: darwinbox
+            connector-type: rust
+          - connector-name: imap
+            connector-type: rust
+          - connector-name: web
+            connector-type: rust
+          - connector-name: nextcloud
+            connector-type: rust
+          - connector-name: github
+            connector-type: python
+          - connector-name: hubspot
+            connector-type: python
+          - connector-name: salesforce
+            connector-type: python
+          - connector-name: snowflake
+            connector-type: python
+          - connector-name: microsoft
+            connector-type: python
+          - connector-name: google_ads
+            connector-type: python
+          - connector-name: notion
+            connector-type: python
+          - connector-name: clickup
+            connector-type: python
+          - connector-name: paperless
+            connector-type: python
+          - connector-name: linear
+            connector-type: typescript
+          - connector-name: windshift
+            connector-type: typescript
+    uses: ./.github/workflows/build-connector.yml
+    with:
+      connector-name: ${{ matrix.connector-name }}
+      connector-type: ${{ matrix.connector-type }}
+    secrets: inherit
+
+  build-cli:
+    needs: detect-changes
+    if: >
+      needs.detect-changes.outputs.is-tag == 'true' ||
+      needs.detect-changes.outputs.cli == 'true'
+    uses: ./.github/workflows/build-cli.yml
+
+  # ---------------------------------------------------------------------------
+  # Deployment packaging
+  # ---------------------------------------------------------------------------
+  package-deployment:
+    needs: detect-changes
+    if: >
+      github.event_name != 'pull_request' &&
+      (needs.detect-changes.outputs.is-tag == 'true' || needs.detect-changes.outputs.deployment == 'true')
+    uses: ./.github/workflows/package-deployment.yml
+    secrets: inherit
+
+  # ---------------------------------------------------------------------------
+  # Release publishing (only after all builds succeed)
+  # ---------------------------------------------------------------------------
+  publish-release:
+    needs: [detect-changes, release-services, release-connectors, build-cli, package-deployment]
+    if: needs.detect-changes.outputs.is-tag == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          REPO="${{ github.repository }}"
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; publishing it"
+            gh release edit "$TAG" --repo "$REPO" --draft=false
+          else
+            gh release create "$TAG" \
+              --repo "$REPO" \
+              --verify-tag \
+              --generate-notes
+          fi
+
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.OMNI_ENTERPRISE_APP_ID }}
+          private-key: ${{ secrets.OMNI_ENTERPRISE_APP_PRIVATE_KEY }}
+          owner: getomnico
+          repositories: omni-enterprise
+
+      - name: Push tag to omni-enterprise
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          REPO="getomnico/omni-enterprise"
+          if gh api "repos/${REPO}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists in ${REPO}; nothing to do"
+          else
+            SHA="$(gh api "repos/${REPO}/commits/master" --jq .sha)"
+            gh api --method POST "repos/${REPO}/git/refs" \
+              -f ref="refs/tags/${TAG}" \
+              -f sha="${SHA}"
+            echo "Pushed tag ${TAG} to ${REPO}"
+          fi

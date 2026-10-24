@@ -1,0 +1,259 @@
+"""
+Anthropic Claude Provider.
+"""
+
+import json
+import logging
+from collections.abc import AsyncIterator, Iterable
+from typing import Any, ClassVar, cast
+
+from anthropic import APIStatusError, AsyncAnthropic, AsyncStream, MessageStreamEvent
+from anthropic.types import MessageParam, ToolParam
+
+from . import LLMProvider, TokenUsage
+from .anthropic_message_adapter import build_messages_for_anthropic_api
+from .types import ProviderError, ProviderType
+
+
+def _anthropic_status_code(e: BaseException) -> int | None:
+    return e.status_code if isinstance(e, APIStatusError) else None
+
+
+def _anthropic_context_overflow(e: BaseException) -> bool:
+    if not isinstance(e, APIStatusError):
+        return False
+    if e.status_code == 413:
+        return True
+    body = getattr(e, "body", None)
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict) and error.get("type") == "request_too_large":
+            return True
+    return "prompt is too long" in str(e).lower()
+
+
+logger = logging.getLogger(__name__)
+
+
+class AnthropicProvider(LLMProvider):
+    """Provider for Anthropic Claude API."""
+
+    provider_type: ClassVar[ProviderType] = ProviderType.ANTHROPIC
+
+    @property
+    def supports_citations(self) -> bool:
+        return True
+
+    def __init__(self, api_key: str, model: str):
+        self.api_key = api_key
+        self.client = AsyncAnthropic(api_key=api_key)
+        self.model = model
+        self.model_name = model
+
+    def add_cache_control(
+        self,
+        messages: Iterable[MessageParam],
+        tools: list[ToolParam] | None = None,
+    ) -> None:
+        """Remove all existing cache control blocks and add them only to the last message and last tool."""
+        # Remove cache control from all message content blocks
+        for msg in messages:
+            if "content" in msg and isinstance(msg["content"], list):
+                for block in msg["content"]:
+                    if isinstance(block, dict) and "cache_control" in block:
+                        del block["cache_control"]
+
+        # Remove cache control from all tools
+        if tools:
+            for tool in tools:
+                if "cache_control" in tool:
+                    del tool["cache_control"]
+
+        # Add cache control to last message's last content block
+        if messages:
+            last_msg = messages[-1]
+            if "content" in last_msg and isinstance(last_msg["content"], list):
+                last_msg_blocks = last_msg["content"]
+                if len(last_msg_blocks) > 0:
+                    last_msg_blocks[-1]["cache_control"] = {"type": "ephemeral"}
+
+        # Add cache control to last tool
+        if tools and len(tools) > 0:
+            tools[-1]["cache_control"] = {"type": "ephemeral"}
+
+    def build_messages_for_api(
+        self,
+        messages: list[MessageParam],
+    ) -> list[MessageParam]:
+        """Convert Omni's internal message blocks to Anthropic's request shape."""
+        return build_messages_for_anthropic_api(messages)
+
+    async def stream_response(
+        self,
+        prompt: str,
+        max_tokens: int | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        messages: list[dict[str, Any]] | None = None,
+        system_prompt: str | None = None,
+        *,
+        model: str | None = None,
+        thinking: dict[str, Any] | None = None,
+        output_config: dict[str, Any] | None = None,
+    ) -> AsyncIterator[MessageStreamEvent]:
+        """Stream response from Anthropic Claude API."""
+        try:
+            active_model = model or self.model
+            # Use provided messages or create from prompt
+            msg_list = (
+                self.build_messages_for_api(cast(list[MessageParam], messages))
+                if messages
+                else [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+            )
+
+            # Add cache control blocks (removes old ones first)
+            self.add_cache_control(msg_list, cast(list[ToolParam] | None, tools))
+
+            # Prepare request parameters
+            request_params: dict[str, Any] = {
+                "model": active_model,
+                "messages": msg_list,
+                "max_tokens": max_tokens or 8192,
+                "stream": True,
+            }
+
+            if thinking is not None:
+                request_params["thinking"] = thinking
+
+            if output_config is not None:
+                request_params["output_config"] = output_config
+
+            # Add tools if provided
+            if tools:
+                request_params["tools"] = tools
+                logger.info(
+                    f"Sending request with {len(tools)} tools: {[t['name'] for t in tools]}"
+                )
+            else:
+                logger.info(f"Sending request without tools")
+
+            logger.info(
+                f"Model: {self.model}, Messages: {len(msg_list)}, Max tokens: {request_params['max_tokens']}"
+            )
+            logger.debug(
+                f"Full request params: {json.dumps({k: v for k, v in request_params.items() if k != 'messages'}, indent=2)}"
+            )
+            logger.debug(f"Messages: {json.dumps(msg_list, indent=2)}")
+
+            if system_prompt:
+                request_params["system"] = system_prompt
+
+            stream: AsyncStream[MessageStreamEvent] = await self.client.messages.create(
+                **request_params,
+            )
+            logger.info(f"Stream created successfully, starting to process events")
+
+            event_count = 0
+            async for event in stream:
+                event_count += 1
+                logger.debug(f"Event {event_count}: {event.type}")
+                if event.type == "content_block_start":
+                    logger.info(f"Content block start: type={event.content_block.type}")
+                    if event.content_block.type == "tool_use":
+                        logger.info(
+                            f"Tool use started: {event.content_block.name} (id: {event.content_block.id}) (input: {json.dumps(event.content_block.input)})"
+                        )
+                elif event.type == "content_block_delta":
+                    if event.delta.type == "text_delta":
+                        logger.debug(f"Text delta: '{event.delta.text}'")
+                    elif event.delta.type == "input_json_delta":
+                        logger.debug(f"JSON delta: {event.delta.partial_json}")
+                elif event.type == "citation":
+                    logger.info(f"Citation: {event.citation}")
+                elif event.type == "content_block_stop":
+                    logger.info(
+                        f"Content block stop at index {getattr(event, 'index', '<unknown>')}"
+                    )
+                elif event.type == "message_delta":
+                    logger.info(f"Message delta stop reason: {event.delta.stop_reason}")
+                elif event.type == "message_stop":
+                    logger.info(f"Message completed after {event_count} events")
+
+                yield event
+
+        except Exception as e:
+            logger.error(f"Failed to stream from Anthropic: {str(e)}", exc_info=True)
+            raise ProviderError(
+                str(e),
+                provider_type=self.provider_type,
+                model=model or self.model_name,
+                status_code=_anthropic_status_code(e),
+                cause=e,
+                is_context_overflow=_anthropic_context_overflow(e),
+            ) from e
+
+    async def generate_response(
+        self,
+        prompt: str,
+        max_tokens: int | None = None,
+        *,
+        model: str | None = None,
+    ) -> tuple[str, TokenUsage]:
+        """Generate non-streaming response from Anthropic Claude API."""
+        try:
+            active_model = model or self.model
+            request_params: dict[str, Any] = {
+                "model": active_model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens or 4096,
+                "stream": False,
+            }
+
+            response = await self.client.messages.create(**request_params)
+
+            usage = TokenUsage(
+                input_tokens=response.usage.input_tokens,
+                output_tokens=response.usage.output_tokens,
+                cache_read_tokens=getattr(response.usage, "cache_read_input_tokens", 0)
+                or 0,
+                cache_creation_tokens=getattr(
+                    response.usage, "cache_creation_input_tokens", 0
+                )
+                or 0,
+            )
+
+            # Extract text content from response
+            content = ""
+            for block in response.content:
+                if hasattr(block, "text"):
+                    content += block.text
+
+            return content, usage
+
+        except Exception as e:
+            logger.error(f"Failed to generate response from Anthropic: {str(e)}")
+            raise ProviderError(
+                str(e),
+                provider_type=self.provider_type,
+                model=model or self.model_name,
+                status_code=_anthropic_status_code(e),
+                cause=e,
+                is_context_overflow=_anthropic_context_overflow(e),
+            ) from e
+
+    async def health_check(
+        self,
+        *,
+        model: str | None = None,
+    ) -> bool:
+        """Check if Anthropic API is accessible."""
+        try:
+            # Try a minimal request to check API accessibility
+            response = await self.client.messages.create(
+                model=model or self.model,
+                messages=[{"role": "user", "content": "Hello"}],
+                max_tokens=1,
+                stream=False,
+            )
+            return True
+        except Exception:
+            return False

@@ -1,0 +1,420 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
+from datetime import timedelta
+from pathlib import Path
+from typing import Any, TypeVar
+
+from mcp.client.session import ClientSession
+from mcp.client.stdio import StdioServerParameters, stdio_client
+from pydantic import AnyUrl
+
+from .mcp_config import (
+    MCP_AUTH_REQUIRED_MESSAGE,
+    MCP_AUTH_STATUS_FILE_ENV,
+    McpServer,
+    StdioMcpServer,
+)
+from .mcp_config import HttpMcpServer as HttpMcpServer
+from .models import (
+    ActionDefinition,
+    ActionResponse,
+    McpPromptArgument,
+    McpPromptDefinition,
+    McpResourceDefinition,
+)
+
+logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
+
+class McpAdapter:
+    """Bridges an external MCP server into Omni's connector protocol.
+
+    Supports two transports:
+    - stdio: spawns the MCP server as a subprocess and talks JSON-RPC over
+      stdin/stdout. Works with MCP servers written in any language.
+    - Streamable HTTP: connects to a remote MCP endpoint per the MCP spec.
+
+    Each operation opens a fresh session and tears it down afterwards.
+    Tool/resource/prompt definitions are cached in memory after the first
+    successful discovery so manifest builds don't require live auth.
+    """
+
+    def __init__(self, server: McpServer) -> None:
+        self._server = server
+        self._cached_actions: list[ActionDefinition] | None = None
+        self._cached_resources: list[McpResourceDefinition] | None = None
+        self._cached_prompts: list[McpPromptDefinition] | None = None
+
+    @asynccontextmanager
+    async def _open_session(
+        self,
+        env: dict[str, str] | None,
+        headers: dict[str, str] | None,
+    ) -> AsyncIterator[ClientSession]:
+        if isinstance(self._server, StdioMcpServer):
+            merged_env = {**(self._server.env or {}), **(env or {})}
+            params = StdioServerParameters(
+                command=self._server.command,
+                args=list(self._server.args),
+                env=merged_env or None,
+                cwd=self._server.cwd,
+            )
+            logger.debug(
+                "Spawning MCP subprocess: %s %s (env keys: %s)",
+                params.command,
+                " ".join(params.args),
+                sorted(merged_env.keys()),
+            )
+            async with stdio_client(params) as (read_stream, write_stream):
+                async with ClientSession(read_stream, write_stream) as session:
+                    await session.initialize()
+                    yield session
+        else:
+            from mcp.client.streamable_http import streamablehttp_client
+
+            merged_headers = {**self._server.headers, **(headers or {})}
+            logger.debug(
+                "Opening MCP HTTP session: %s (header keys: %s)",
+                self._server.url,
+                sorted(merged_headers.keys()),
+            )
+            async with streamablehttp_client(
+                self._server.url,
+                headers=merged_headers or None,
+                timeout=timedelta(seconds=self._server.timeout_seconds),
+                sse_read_timeout=timedelta(
+                    seconds=self._server.sse_read_timeout_seconds
+                ),
+            ) as (read_stream, write_stream, _get_session_id):
+                async with ClientSession(read_stream, write_stream) as session:
+                    await session.initialize()
+                    yield session
+
+    async def _run(
+        self,
+        callback: Callable[[ClientSession], Awaitable[T]],
+        *,
+        env: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> T:
+        # Cancellation of this task closes stdio_client and terminates the
+        # child process. Keep a hung official MCP/CLI process from surviving a
+        # request indefinitely.
+        try:
+            timeout_seconds = min(
+                max(float(os.environ.get("OMNI_MCP_TIMEOUT_SECONDS", "120")), 1.0),
+                300.0,
+            )
+        except ValueError:
+            timeout_seconds = 120.0
+        try:
+            return await asyncio.wait_for(
+                self._run_unbounded(callback, env=env, headers=headers),
+                timeout=timeout_seconds,
+            )
+        except Exception as exc:
+            # A provider launcher may leave this short-lived marker after a
+            # terminal OAuth rejection. Consume it here so bootstrap callers
+            # also clean it up, while the normalized exception lets the HTTP
+            # server return the standard 412 response. Marker IO is best
+            # effort: a read or cleanup failure must never mask the original
+            # MCP failure.
+            status_file = (env or {}).get(MCP_AUTH_STATUS_FILE_ENV)
+            requires_auth = False
+            if isinstance(status_file, str) and status_file:
+                try:
+                    content = Path(status_file).read_text(encoding="utf-8").strip()
+                    requires_auth = content == "needs_user_auth"
+                except OSError:
+                    pass
+                try:
+                    Path(status_file).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            if requires_auth:
+                raise RuntimeError(MCP_AUTH_REQUIRED_MESSAGE) from exc
+            raise
+
+    async def _run_unbounded(
+        self,
+        callback: Callable[[ClientSession], Awaitable[T]],
+        *,
+        env: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> T:
+        async with self._open_session(env, headers) as session:
+            return await callback(session)
+
+    def _clear_catalog_cache(self) -> None:
+        self._cached_actions = None
+        self._cached_resources = None
+        self._cached_prompts = None
+
+    @property
+    def _has_cached_catalog(self) -> bool:
+        return (
+            self._cached_actions is not None
+            or self._cached_resources is not None
+            or self._cached_prompts is not None
+        )
+
+    async def discover(
+        self,
+        env: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        """Connect to MCP and cache tools plus optional resources/prompts.
+
+        MCP servers are allowed to implement only tools. In particular, some
+        official provider servers return ``Method not found`` for the
+        optional resource and prompt list methods, so those failures must not
+        discard a successfully discovered tool catalog.
+        """
+
+        # A failed discovery must not leave a removed or policy-disabled
+        # catalog active. Publish a catalog only after this attempt succeeds.
+        self._clear_catalog_cache()
+
+        async def _discover(session: ClientSession) -> None:
+            actions = await self._fetch_actions(session)
+            try:
+                resources = await self._fetch_resources(session)
+            except Exception:
+                logger.info("MCP server does not expose resources", exc_info=True)
+                resources = []
+            try:
+                prompts = await self._fetch_prompts(session)
+            except Exception:
+                logger.info("MCP server does not expose prompts", exc_info=True)
+                prompts = []
+
+            # Publish a complete catalog only after every optional lookup has
+            # settled. This prevents a partial failed discovery from looking
+            # like a valid cache on the next manifest registration.
+            self._cached_actions = actions
+            self._cached_resources = resources
+            self._cached_prompts = prompts
+
+        await self._run(_discover, env=env, headers=headers)
+        logger.info(
+            "MCP discovery complete: %d tools, %d resources, %d prompts",
+            len(self._cached_actions or []),
+            len(self._cached_resources or []),
+            len(self._cached_prompts or []),
+        )
+
+    async def get_action_definitions(
+        self,
+        env: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> list[ActionDefinition]:
+        if env is not None or headers is not None:
+            try:
+
+                async def _fetch(session: ClientSession) -> list[ActionDefinition]:
+                    actions = await self._fetch_actions(session)
+                    self._cached_actions = actions
+                    logger.debug("Fetched %d action definitions (live)", len(actions))
+                    return actions
+
+                return await self._run(_fetch, env=env, headers=headers)
+            except Exception:
+                if self._cached_actions is not None:
+                    logger.debug(
+                        "Live fetch failed, returning %d cached actions",
+                        len(self._cached_actions),
+                    )
+                    return self._cached_actions
+                raise
+        logger.debug(
+            "No auth provided, returning %d cached actions",
+            len(self._cached_actions or []),
+        )
+        return self._cached_actions or []
+
+    async def get_resource_definitions(
+        self,
+        env: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> list[McpResourceDefinition]:
+        if env is not None or headers is not None:
+            try:
+
+                async def _fetch(session: ClientSession) -> list[McpResourceDefinition]:
+                    resources = await self._fetch_resources(session)
+                    self._cached_resources = resources
+                    return resources
+
+                return await self._run(_fetch, env=env, headers=headers)
+            except Exception:
+                logger.info("MCP resource discovery unavailable", exc_info=True)
+                return self._cached_resources or []
+        return self._cached_resources or []
+
+    async def get_prompt_definitions(
+        self,
+        env: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> list[McpPromptDefinition]:
+        if env is not None or headers is not None:
+            try:
+
+                async def _fetch(session: ClientSession) -> list[McpPromptDefinition]:
+                    prompts = await self._fetch_prompts(session)
+                    self._cached_prompts = prompts
+                    return prompts
+
+                return await self._run(_fetch, env=env, headers=headers)
+            except Exception:
+                logger.info("MCP prompt discovery unavailable", exc_info=True)
+                return self._cached_prompts or []
+        return self._cached_prompts or []
+
+    async def execute_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        env: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> ActionResponse:
+        try:
+
+            async def _call(session: ClientSession) -> ActionResponse:
+                result = await session.call_tool(name, arguments)
+                text_parts: list[str] = []
+                for block in result.content:
+                    if hasattr(block, "text"):
+                        text_parts.append(block.text)
+                    elif hasattr(block, "data"):
+                        text_parts.append(
+                            f"[binary: {getattr(block, 'mimeType', 'unknown')}]"
+                        )
+                content = "\n".join(text_parts)
+                if result.isError:
+                    return ActionResponse.failure(content)
+                return ActionResponse.success({"content": content})
+
+            return await self._run(_call, env=env, headers=headers)
+        except Exception as e:
+            logger.error("MCP tool %s failed: %s", name, e)
+            return ActionResponse.failure(str(e))
+
+    async def read_resource(
+        self,
+        uri: str,
+        env: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        async def _read(session: ClientSession) -> dict[str, Any]:
+            result = await session.read_resource(AnyUrl(uri))
+            items: list[dict[str, Any]] = []
+            for item in result.contents:
+                entry: dict[str, Any] = {"uri": str(item.uri)}
+                if hasattr(item, "text") and item.text is not None:
+                    entry["text"] = item.text
+                if hasattr(item, "mimeType") and item.mimeType:
+                    entry["mime_type"] = item.mimeType
+                items.append(entry)
+            return {"contents": items}
+
+        return await self._run(_read, env=env, headers=headers)
+
+    async def get_prompt(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+        env: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        async def _get(session: ClientSession) -> dict[str, Any]:
+            result = await session.get_prompt(name, arguments)
+            messages: list[dict[str, Any]] = []
+            for msg in result.messages:
+                content_data: dict[str, Any]
+                if hasattr(msg.content, "text"):
+                    content_data = {"type": "text", "text": msg.content.text}
+                else:
+                    content_data = {"type": "unknown"}
+                messages.append({"role": msg.role, "content": content_data})
+            return {"description": result.description, "messages": messages}
+
+        return await self._run(_get, env=env, headers=headers)
+
+    # -- internal helpers to convert MCP types to Omni models --
+
+    @staticmethod
+    async def _fetch_actions(session: ClientSession) -> list[ActionDefinition]:
+        result = await session.list_tools()
+        actions: list[ActionDefinition] = []
+        for tool in result.tools:
+            is_read_only = bool(tool.annotations and tool.annotations.readOnlyHint)
+            actions.append(
+                ActionDefinition(
+                    name=tool.name,
+                    description=tool.description or "",
+                    input_schema=tool.inputSchema
+                    or {"type": "object", "properties": {}},
+                    mode="read" if is_read_only else "write",
+                    credential_scope="user",
+                    # MCP tools are not admin-only by default.
+                    admin_only=False,
+                    origin="mcp",
+                )
+            )
+        return actions
+
+    @staticmethod
+    async def _fetch_resources(session: ClientSession) -> list[McpResourceDefinition]:
+        definitions: list[McpResourceDefinition] = []
+
+        templates_result = await session.list_resource_templates()
+        for tmpl in templates_result.resourceTemplates:
+            definitions.append(
+                McpResourceDefinition(
+                    uri_template=str(tmpl.uriTemplate),
+                    name=tmpl.name,
+                    description=tmpl.description,
+                    mime_type=tmpl.mimeType,
+                )
+            )
+
+        resources_result = await session.list_resources()
+        for res in resources_result.resources:
+            definitions.append(
+                McpResourceDefinition(
+                    uri_template=str(res.uri),
+                    name=res.name,
+                    description=res.description,
+                    mime_type=res.mimeType,
+                )
+            )
+
+        return definitions
+
+    @staticmethod
+    async def _fetch_prompts(session: ClientSession) -> list[McpPromptDefinition]:
+        result = await session.list_prompts()
+        definitions: list[McpPromptDefinition] = []
+        for prompt in result.prompts:
+            args = [
+                McpPromptArgument(
+                    name=arg.name,
+                    description=arg.description,
+                    required=arg.required or False,
+                )
+                for arg in (prompt.arguments or [])
+            ]
+            definitions.append(
+                McpPromptDefinition(
+                    name=prompt.name,
+                    description=prompt.description,
+                    arguments=args,
+                )
+            )
+        return definitions

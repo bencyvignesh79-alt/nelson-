@@ -1,0 +1,537 @@
+"""Unit tests for the OAuth-required envelope encoding and the
+ConnectorToolHandler 412 → oauth_required tool result path.
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+import respx
+from httpx import Response
+
+import tools.connector_handler as connector_handler_module
+from db.models import Source
+from tools.connector_handler import ConnectorAction, ConnectorToolHandler
+from tools.omni_tool_result import (
+    OAuthRequiredPayload,
+    OmniToolResultKind,
+    encode_oauth_required,
+)
+from tools.registry import ToolContext
+
+pytestmark = pytest.mark.unit
+
+
+@pytest.mark.asyncio
+async def test_manifest_preserves_undeclared_and_explicit_empty_action_scopes():
+    source = Source(
+        id="src-1",
+        source_type="example",
+        name="Example",
+        is_active=True,
+        is_deleted=False,
+    )
+    handler = ConnectorToolHandler(
+        connector_manager_url="http://cm.test",
+        user_id="user-1",
+        prefetched_sources=[source],
+    )
+    manifest = {
+        "source_type": "example",
+        "healthy": True,
+        "manifest": {
+            "actions": [
+                {
+                    "name": "undeclared",
+                    "description": "No action-level scope metadata",
+                },
+                {
+                    "name": "explicit_empty",
+                    "description": "Explicitly requires no OAuth scopes",
+                    "required_scopes": [],
+                },
+            ]
+        },
+    }
+
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get("http://cm.test/connectors").mock(
+            return_value=Response(200, json=[manifest])
+        )
+        actions = await handler._fetch_actions()
+
+    by_name = {action.action_name: action for action in actions}
+    assert by_name["undeclared"].required_scopes is None
+    assert by_name["explicit_empty"].required_scopes == []
+
+
+@pytest.mark.asyncio
+async def test_manifest_mcp_actions_populate_supports_user_oauth():
+    source_darwinbox = Source(
+        id="src-db",
+        source_type="darwinbox",
+        name="Darwinbox",
+        is_active=True,
+        is_deleted=False,
+    )
+    source_gmail = Source(
+        id="src-gm",
+        source_type="gmail",
+        name="Gmail",
+        is_active=True,
+        is_deleted=False,
+    )
+    handler = ConnectorToolHandler(
+        connector_manager_url="http://cm.test",
+        user_id="user-1",
+        prefetched_sources=[source_darwinbox, source_gmail],
+    )
+    manifests = [
+        {
+            "source_type": "darwinbox",
+            "healthy": True,
+            "manifest": {
+                "actions": [{"name": "get_my_leave_balance"}],
+            },
+        },
+        {
+            "source_type": "gmail",
+            "healthy": True,
+            "manifest": {
+                "oauth": {"provider": "google"},
+                "actions": [
+                    {"name": "send_email"},
+                    {"name": "create_draft"},
+                    {"name": "org_action", "credential_scope": "org"},
+                ],
+            },
+        },
+    ]
+
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get("http://cm.test/connectors").mock(
+            return_value=Response(200, json=manifests)
+        )
+        actions = await handler._fetch_actions()
+
+    by_name = {action.action_name: action for action in actions}
+    assert by_name["get_my_leave_balance"].supports_user_oauth is False
+    assert by_name["send_email"].supports_user_oauth is True
+    assert by_name["create_draft"].supports_user_oauth is True
+    assert by_name["org_action"].supports_user_oauth is False
+
+
+def _register_action(handler: ConnectorToolHandler, source_id: str) -> None:
+    """Force a fake gmail__send_email action so the handler can dispatch."""
+    handler._actions["gmail__send_email"] = ConnectorAction(
+        source_id=source_id,
+        source_type="gmail",
+        source_name="Test Gmail",
+        action_name="send_email",
+        description="Send an email",
+        input_schema={"type": "object", "properties": {}},
+        mode="write",
+    )
+    handler._initialized = True
+
+
+class _CredentialConnection:
+    def __init__(
+        self, credential: dict | _QueryRoutingConnection
+    ) -> None:
+        self.credential = credential
+
+    async def fetchrow(self, query: str, *_args: object) -> dict | None:
+        if isinstance(self.credential, _QueryRoutingConnection):
+            return await self.credential.fetchrow(query, *_args)
+        return self.credential
+
+
+class _QueryRoutingConnection:
+    """Routes fetchrow calls by SQL shape so a single mock connection can
+    answer the user-credential, source, and org-credential queries that
+    `check_oauth_required` issues when no per-user row exists."""
+
+    def __init__(
+        self,
+        user_credential: dict | None,
+        source_row: dict | None,
+        org_credential: dict | None,
+    ) -> None:
+        self.user_credential = user_credential
+        self.source_row = source_row
+        self.org_credential = org_credential
+
+    async def fetchrow(self, query: str, *_args: object) -> dict | None:
+        if "user_id IS NULL" in query:
+            return self.org_credential
+        if "FROM service_credentials" in query:
+            return self.user_credential
+        if "FROM sources" in query:
+            return self.source_row
+        raise AssertionError(f"unexpected query: {query}")
+
+
+class _AcquireConnection:
+    def __init__(self, credential: dict) -> None:
+        self.connection = _CredentialConnection(credential)
+
+    async def __aenter__(self) -> _CredentialConnection:
+        return self.connection
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+
+class _CredentialPool:
+    def __init__(self, credential: dict) -> None:
+        self.credential = credential
+
+    def acquire(self) -> _AcquireConnection:
+        return _AcquireConnection(self.credential)
+
+
+class TestConnectorHandlerOAuthRequired:
+    @pytest.mark.asyncio
+    async def test_existing_credential_missing_action_scope_requires_oauth(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        handler = ConnectorToolHandler(
+            connector_manager_url="http://cm.test",
+            user_id="user-1",
+        )
+        handler._actions["windshift__add_comment"] = ConnectorAction(
+            source_id="src-1",
+            source_type="windshift",
+            source_name="Windshift",
+            action_name="add_comment",
+            description="Add a comment",
+            input_schema={"type": "object", "properties": {}},
+            mode="write",
+            required_scopes=["items:write"],
+            supports_user_oauth=True,
+        )
+        handler._initialized = True
+
+        async def fake_get_db_pool() -> _CredentialPool:
+            return _CredentialPool(
+                {
+                    "id": "credential-1",
+                    "provider": "windshift",
+                    "config": json.dumps(
+                        {"granted_scopes": ["mcp:access", "items:read"]}
+                    ),
+                }
+            )
+
+        monkeypatch.setattr(connector_handler_module, "get_db_pool", fake_get_db_pool)
+
+        payload = await handler.check_oauth_required(
+            "windshift__add_comment",
+            {},
+            ToolContext(chat_id="c1", user_id="user-1"),
+        )
+
+        assert payload is not None
+        assert payload.oauth_start_url == (
+            "/api/oauth/start?source_id=src-1&flow=user_write&"
+            "required_scopes=items%3Awrite"
+        )
+
+    @pytest.mark.asyncio
+    async def test_existing_credential_with_action_scope_does_not_require_oauth(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        handler = ConnectorToolHandler(
+            connector_manager_url="http://cm.test",
+            user_id="user-1",
+        )
+        handler._actions["windshift__add_comment"] = ConnectorAction(
+            source_id="src-1",
+            source_type="windshift",
+            source_name="Windshift",
+            action_name="add_comment",
+            description="Add a comment",
+            input_schema={"type": "object", "properties": {}},
+            mode="write",
+            required_scopes=["items:write"],
+            supports_user_oauth=True,
+        )
+        handler._initialized = True
+
+        async def fake_get_db_pool() -> _CredentialPool:
+            return _CredentialPool(
+                {
+                    "id": "credential-1",
+                    "provider": "windshift",
+                    "config": {
+                        "granted_scopes": [
+                            "mcp:access",
+                            "items:read",
+                            "items:write",
+                        ]
+                    },
+                }
+            )
+
+        monkeypatch.setattr(connector_handler_module, "get_db_pool", fake_get_db_pool)
+
+        payload = await handler.check_oauth_required(
+            "windshift__add_comment",
+            {},
+            ToolContext(chat_id="c1", user_id="user-1"),
+        )
+
+        assert payload is None
+
+    @pytest.mark.asyncio
+    async def test_org_only_connector_without_user_credential_does_not_require_oauth(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Darwinbox-style connectors (no per-user OAuth flow) must not
+        surface an OAuth prompt when the caller lacks a per-user row: the
+        org credential is used and the action executes. Mirrors
+        connector-manager's resolve_missing_user_credential."""
+        handler = ConnectorToolHandler(
+            connector_manager_url="http://cm.test",
+            user_id="user-1",
+        )
+        handler._actions["darwinbox__get_my_leave_balance"] = ConnectorAction(
+            source_id="src-1",
+            source_type="darwinbox",
+            source_name="Darwinbox",
+            action_name="get_my_leave_balance",
+            description="Get leave balances",
+            input_schema={"type": "object", "properties": {}},
+            mode="read",
+            supports_user_oauth=False,
+        )
+        handler._initialized = True
+
+        async def fake_get_db_pool() -> _CredentialPool:
+            return _CredentialPool(
+                _QueryRoutingConnection(
+                    user_credential=None,
+                    source_row={"integration_type": "connector", "config": {}},
+                    org_credential={"provider": "darwinbox"},
+                )
+            )
+
+        monkeypatch.setattr(connector_handler_module, "get_db_pool", fake_get_db_pool)
+
+        payload = await handler.check_oauth_required(
+            "darwinbox__get_my_leave_balance",
+            {},
+            ToolContext(chat_id="c1", user_id="user-1"),
+        )
+
+        assert payload is None
+
+    @pytest.mark.asyncio
+    async def test_org_only_action_never_queries_credentials(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Actions that do not use per-user OAuth must short-circuit before
+        any credential or scope queries (no DB pool acquisition at all)."""
+        handler = ConnectorToolHandler(
+            connector_manager_url="http://cm.test",
+            user_id="user-1",
+        )
+        handler._actions["darwinbox__get_my_leave_balance"] = ConnectorAction(
+            source_id="src-1",
+            source_type="darwinbox",
+            source_name="Darwinbox",
+            action_name="get_my_leave_balance",
+            description="Get leave balances",
+            input_schema={"type": "object", "properties": {}},
+            mode="read",
+            supports_user_oauth=False,
+        )
+        handler._initialized = True
+
+        async def failing_get_db_pool() -> _CredentialPool:
+            raise AssertionError("credential queries must not run for org-only actions")
+
+        monkeypatch.setattr(connector_handler_module, "get_db_pool", failing_get_db_pool)
+
+        payload = await handler.check_oauth_required(
+            "darwinbox__get_my_leave_balance",
+            {},
+            ToolContext(chat_id="c1", user_id="user-1"),
+        )
+
+        assert payload is None
+
+    @pytest.mark.asyncio
+    async def test_admin_only_action_never_queries_credentials(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        handler = ConnectorToolHandler(
+            connector_manager_url="http://cm.test",
+            user_id="user-1",
+        )
+        handler._actions["google__list_domain_users"] = ConnectorAction(
+            source_id="src-1",
+            source_type="google",
+            source_name="Google",
+            action_name="list_domain_users",
+            description="List users",
+            input_schema={"type": "object", "properties": {}},
+            mode="read",
+            admin_only=True,
+            supports_user_oauth=True,
+        )
+        handler._initialized = True
+
+        async def failing_get_db_pool() -> _CredentialPool:
+            raise AssertionError("credential queries must not run for admin-only actions")
+
+        monkeypatch.setattr(connector_handler_module, "get_db_pool", failing_get_db_pool)
+
+        payload = await handler.check_oauth_required(
+            "google__list_domain_users",
+            {},
+            ToolContext(chat_id="c1", user_id="user-1"),
+        )
+
+        assert payload is None
+
+    @pytest.mark.asyncio
+    async def test_oauth_connector_without_user_credential_requires_oauth(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """OAuth connectors (supports_user_oauth) keep the existing behavior:
+        no per-user row + org credential -> OAuth prompt with the CTA."""
+        handler = ConnectorToolHandler(
+            connector_manager_url="http://cm.test",
+            user_id="user-1",
+        )
+        handler._actions["gmail__send_email"] = ConnectorAction(
+            source_id="src-1",
+            source_type="gmail",
+            source_name="Gmail",
+            action_name="send_email",
+            description="Send an email",
+            input_schema={"type": "object", "properties": {}},
+            mode="write",
+            supports_user_oauth=True,
+        )
+        handler._initialized = True
+
+        async def fake_get_db_pool() -> _CredentialPool:
+            return _CredentialPool(
+                _QueryRoutingConnection(
+                    user_credential=None,
+                    source_row={"integration_type": "connector", "config": {}},
+                    org_credential={"provider": "google"},
+                )
+            )
+
+        monkeypatch.setattr(connector_handler_module, "get_db_pool", fake_get_db_pool)
+
+        payload = await handler.check_oauth_required(
+            "gmail__send_email",
+            {},
+            ToolContext(chat_id="c1", user_id="user-1"),
+        )
+
+        assert payload is not None
+        assert payload.source_id == "src-1"
+        assert payload.source_type == "gmail"
+        assert payload.provider == "google"
+        assert payload.oauth_start_url == "/api/oauth/start?source_id=src-1"
+
+    @pytest.mark.asyncio
+    async def test_412_response_produces_structured_oauth_required(self):
+        """A 412 needs_user_auth response from connector-manager must yield a
+        ToolResult whose content carries an oauth_required envelope and whose
+        oauth_required field is the typed payload (so chat.py can pause)."""
+        handler = ConnectorToolHandler(
+            connector_manager_url="http://cm.test",
+            user_id="user-1",
+        )
+        _register_action(handler, source_id="src-1")
+
+        body = {
+            "error": "needs_user_auth",
+            "source_id": "src-1",
+            "source_type": "gmail",
+            "provider": "google",
+            "oauth_start_url": "/api/oauth/start?source_id=src-1",
+        }
+        with respx.mock(assert_all_called=True) as mock:
+            mock.post("http://cm.test/action").mock(
+                return_value=Response(412, json=body)
+            )
+            result = await handler.execute(
+                "gmail__send_email",
+                {"to": "x@y.com"},
+                ToolContext(chat_id="c1", user_id="user-1"),
+            )
+
+        assert result.is_error is False
+        assert result.oauth_required is not None
+        assert result.oauth_required.source_id == "src-1"
+        assert result.oauth_required.source_type == "gmail"
+        assert result.oauth_required.provider == "google"
+        assert (
+            result.oauth_required.oauth_start_url == "/api/oauth/start?source_id=src-1"
+        )
+
+        assert len(result.content) == 1
+        envelope_text = result.content[0]["text"]
+        parsed = json.loads(envelope_text)
+        assert parsed["omni_kind"] == OmniToolResultKind.OAUTH_REQUIRED.value
+        assert parsed["payload"] == {
+            "source_id": "src-1",
+            "source_type": "gmail",
+            "provider": "google",
+            "oauth_start_url": "/api/oauth/start?source_id=src-1",
+        }
+
+    @pytest.mark.asyncio
+    async def test_normal_200_does_not_set_oauth_required(self):
+        handler = ConnectorToolHandler(
+            connector_manager_url="http://cm.test",
+            user_id="user-1",
+        )
+        _register_action(handler, source_id="src-1")
+
+        with respx.mock(assert_all_called=True) as mock:
+            mock.post("http://cm.test/action").mock(
+                return_value=Response(
+                    200,
+                    json={"status": "ok", "result": {"message_id": "abc"}},
+                )
+            )
+            result = await handler.execute(
+                "gmail__send_email",
+                {"to": "x@y.com"},
+                ToolContext(chat_id="c1", user_id="user-1"),
+            )
+
+        assert result.oauth_required is None
+        assert result.is_error is False
+        assert "abc" in result.content[0]["text"]
+
+
+class TestEncodeOAuthRequired:
+    def test_encodes_envelope_with_payload(self):
+        payload = OAuthRequiredPayload(
+            source_id="src-1",
+            source_type="gmail",
+            provider="google",
+            oauth_start_url="/api/oauth/start?source_id=src-1",
+        )
+        block = encode_oauth_required(payload)
+
+        assert block["type"] == "text"
+        envelope = json.loads(block["text"])
+        assert envelope["omni_kind"] == OmniToolResultKind.OAUTH_REQUIRED.value
+        assert envelope["payload"] == {
+            "source_id": "src-1",
+            "source_type": "gmail",
+            "provider": "google",
+            "oauth_start_url": "/api/oauth/start?source_id=src-1",
+        }

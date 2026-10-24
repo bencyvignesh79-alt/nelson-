@@ -1,0 +1,37 @@
+pub mod client;
+pub mod connector;
+pub mod context;
+pub mod mcp_adapter;
+pub mod models;
+pub mod server;
+
+pub use client::{SdkClient, SdkError, SdkResult, build_connector_url};
+pub use connector::{Connector, SyncRequestValidationError};
+pub use context::SyncContext;
+pub use mcp_adapter::{
+    HttpMcpServer, MCP_AUTH_REQUIRED_MESSAGE, MCP_AUTH_STATUS_FILE_ENV, McpAdapter, McpServer,
+    StdioMcpServer,
+};
+pub use models::{
+    ActionRequest, ActionResponse, CancelRequest, CancelResponse, McpCredentials,
+    OAuthCredentialReadyRequest, OAuthManifestConfig, OAuthScopeSet, OAuthTokenEndpointAuthMethod,
+    PromptRequest, ResourceRequest, SkillRequest, SkillResponse, SyncRequest, SyncResponse,
+    SyncStatusResponse, UserRole,
+};
+pub use server::{ServerConfig, create_router, serve, serve_with_config, serve_with_extra_routes};
+
+pub use shared::models::DocumentAttributes;
+pub use shared::models::{
+    ActionCredentialScope, ActionDefinition, ActionMode, ActionOrigin, AuthType, ConnectorEvent,
+    ConnectorManifest, ConnectorSkillDefinition, ConnectorSourceCapabilities, DocumentMetadata,
+    DocumentPermissions, IntegrationType, McpPromptDefinition, McpResourceDefinition,
+    OAuthCredentialFlow, OAuthCredentialValidationRequest, OAuthCredentialValidationResponse,
+    OAuthSourceBinding, PersonSyncRecord, SearchOperator, ServiceCredential, ServiceProvider,
+    Source, SourceType, SyncRun, SyncStatus, SyncType,
+};
+pub use shared::rate_limiter::{RateLimiter, RetryableError};
+pub use shared::telemetry;
+
+pub mod content_extractor {
+    pub use shared::content_extractor::extract_content;
+}

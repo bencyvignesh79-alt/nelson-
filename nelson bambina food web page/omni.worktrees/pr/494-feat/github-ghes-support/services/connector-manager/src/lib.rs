@@ -1,0 +1,220 @@
+pub mod config;
+pub mod connector_client;
+pub mod credential_service;
+pub mod handlers;
+pub mod models;
+pub mod remote_mcp;
+pub mod scheduler;
+pub mod source_cleanup;
+pub mod sync_circuit_breaker;
+pub mod sync_manager;
+
+use anyhow::Result as AnyhowResult;
+use axum::{
+    extract::DefaultBodyLimit,
+    middleware,
+    routing::{get, post, put},
+    Router,
+};
+use config::ConnectorManagerConfig;
+use redis::Client as RedisClient;
+use remote_mcp::{gateway::RemoteMcpGateway, registry};
+use shared::{
+    telemetry::{self, TelemetryConfig},
+    DatabasePool, ObjectStorage,
+};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use sync_manager::SyncManager;
+use tokio::sync::Semaphore;
+use tower::ServiceBuilder;
+use tower_http::cors::CorsLayer;
+use tracing::{info, warn};
+
+#[derive(Clone)]
+pub struct AppState {
+    pub db_pool: DatabasePool,
+    pub redis_client: RedisClient,
+    pub config: ConnectorManagerConfig,
+    pub sync_manager: Arc<SyncManager>,
+    pub remote_mcp_gateway: Arc<RemoteMcpGateway>,
+    pub content_storage: Arc<dyn ObjectStorage>,
+    pub extraction_semaphore: Arc<Semaphore>,
+}
+
+pub fn create_app(state: AppState) -> Router {
+    Router::new()
+        // Health and management endpoints
+        .route("/health", get(handlers::health_check))
+        .route("/sync", post(handlers::trigger_sync))
+        .route("/sync/:source_id", post(handlers::trigger_sync_by_id))
+        .route("/sync/:id/cancel", post(handlers::cancel_sync))
+        .route("/sync/:id/progress", get(handlers::get_sync_progress))
+        .route("/schedules", get(handlers::list_schedules))
+        .route("/sources", get(handlers::list_sources))
+        .route(
+            "/sources/active",
+            get(handlers::list_active_sources_for_capabilities),
+        )
+        .route("/sources/:source_id", get(handlers::get_source))
+        .route("/connectors", get(handlers::list_connectors))
+        .route(
+            "/remote-mcp/:source_id/refresh",
+            post(handlers::refresh_remote_mcp_catalog),
+        )
+        .route("/action", post(handlers::execute_action))
+        .route("/actions", get(handlers::list_actions))
+        .route("/resource", post(handlers::read_resource))
+        .route("/resources", get(handlers::list_resources))
+        .route("/prompt", post(handlers::get_prompt))
+        .route("/prompts", get(handlers::list_prompts))
+        .route(
+            "/oauth/validate",
+            post(handlers::validate_oauth_credential),
+        )
+        .route(
+            "/oauth/credential-ready",
+            post(handlers::oauth_credential_ready),
+        )
+        .route("/skill", post(handlers::get_skill))
+        .route("/skills", get(handlers::list_skills))
+        // SDK endpoints - called by connectors
+        .route("/sdk/register", post(handlers::sdk_register))
+        .route("/sdk/events", post(handlers::sdk_emit_event))
+        .route("/sdk/events/batch", post(handlers::sdk_emit_batch))
+        .route("/sdk/content", post(handlers::sdk_store_content))
+        .route("/sdk/extract-content", post(handlers::sdk_extract_content))
+        .route("/sdk/extract-text", post(handlers::sdk_extract_text))
+        .route("/sdk/sync/:id/heartbeat", post(handlers::sdk_heartbeat))
+        .route("/sdk/sync/:id/complete", post(handlers::sdk_complete))
+        .route("/sdk/sync/:id/fail", post(handlers::sdk_fail))
+        .route(
+            "/sdk/sync/:id/checkpoint",
+            put(handlers::sdk_update_checkpoint),
+        )
+        .route(
+            "/sdk/sync/:id/scanned",
+            post(handlers::sdk_increment_scanned),
+        )
+        .route(
+            "/sdk/sync/:id/updated",
+            post(handlers::sdk_increment_updated),
+        )
+        .route("/sdk/source/:source_id", get(handlers::sdk_get_source))
+        .route(
+            "/sdk/credentials/:source_id",
+            get(handlers::sdk_get_credentials),
+        )
+        .route(
+            "/sdk/source/:source_id/sync-config",
+            get(handlers::sdk_get_source_sync_config),
+        )
+        .route("/sdk/sync/create", post(handlers::sdk_create_sync))
+        .route("/sdk/sync/cancel", post(handlers::sdk_cancel_sync))
+        // User email endpoint
+        .route(
+            "/sdk/source/:source_id/user-email",
+            get(handlers::sdk_get_user_email),
+        )
+        // Webhook notification endpoint
+        .route("/sdk/webhook/notify", post(handlers::sdk_notify_webhook))
+        // Connector state management
+        .route(
+            "/sdk/source/:source_id/connector-state",
+            put(handlers::sdk_update_connector_state),
+        )
+        // Sources by type
+        .route(
+            "/sdk/sources/by-type/:source_type",
+            get(handlers::sdk_get_sources_by_type),
+        )
+        // Connector config
+        .route(
+            "/sdk/connector-configs/:provider",
+            get(handlers::sdk_get_connector_config),
+        )
+        .layer(DefaultBodyLimit::disable())
+        .layer(
+            ServiceBuilder::new()
+                .layer(middleware::from_fn(telemetry::middleware::trace_layer))
+                .layer(CorsLayer::permissive()),
+        )
+        .with_state(state)
+}
+
+pub async fn run_server() -> AnyhowResult<()> {
+    dotenvy::dotenv().ok();
+
+    let telemetry_config = TelemetryConfig::from_env("omni-connector-manager");
+    telemetry::init_telemetry(telemetry_config)?;
+
+    info!("Connector Manager service starting...");
+
+    let config = ConnectorManagerConfig::from_env();
+    info!("Configuration loaded");
+
+    let db_pool = DatabasePool::from_config(&config.database)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create database pool: {}", e))?;
+    info!("Database pool initialized");
+
+    let redis_client = RedisClient::open(config.redis.redis_url.clone())?;
+    info!("Redis client initialized");
+
+    let content_storage = shared::StorageFactory::from_env(db_pool.pool().clone())
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create content storage: {}", e))?;
+    info!("Content storage initialized");
+
+    let sync_manager = Arc::new(SyncManager::new(
+        &db_pool,
+        config.clone(),
+        redis_client.clone(),
+    ));
+    let remote_mcp_gateway = Arc::new(RemoteMcpGateway::new(
+        db_pool.clone(),
+        redis_client.clone(),
+    )?);
+
+    let app_state = AppState {
+        db_pool: db_pool.clone(),
+        redis_client: redis_client.clone(),
+        config: config.clone(),
+        sync_manager: sync_manager.clone(),
+        remote_mcp_gateway: remote_mcp_gateway.clone(),
+        content_storage,
+        extraction_semaphore: Arc::new(Semaphore::new(config.extraction_concurrency)),
+    };
+
+    // Reconcile any sync_runs left in 'running' state from a previous
+    // manager process before starting the scheduler.
+    if let Err(e) = sync_manager.monitor_running_syncs().await {
+        warn!("Startup sync reconciliation failed: {}", e);
+    }
+
+    registry::startup_register_remote_mcp_sources((*remote_mcp_gateway).clone(), db_pool.clone())
+        .await;
+    tokio::spawn(registry::run_remote_mcp_registry_loop(
+        (*remote_mcp_gateway).clone(),
+        db_pool.clone(),
+    ));
+    info!("Remote MCP registry started");
+
+    tokio::spawn(scheduler::Scheduler::run(
+        db_pool.pool().clone(),
+        redis_client,
+        config.clone(),
+        sync_manager,
+    ));
+    info!("Scheduler started");
+
+    let app = create_app(app_state);
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
+    info!("Connector Manager service listening on {}", addr);
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}

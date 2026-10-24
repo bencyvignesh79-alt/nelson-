@@ -1,0 +1,43 @@
+[package]
+name = "omni-sandbox"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "omni_sandbox"
+path = "src/lib.rs"
+
+[[bin]]
+name = "omni-sandbox"
+path = "src/main.rs"
+
+[[bin]]
+name = "sandbox-exec"
+path = "src/bin/sandbox_exec.rs"
+
+[dependencies]
+tokio = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+dotenvy = { workspace = true }
+tower-http = { workspace = true }
+base64 = "0.22"
+mime_guess = "2"
+nix = { version = "0.29", features = ["process", "fs"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+
+[dev-dependencies]
+axum-test = { workspace = true }
+testcontainers = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = "0.22"

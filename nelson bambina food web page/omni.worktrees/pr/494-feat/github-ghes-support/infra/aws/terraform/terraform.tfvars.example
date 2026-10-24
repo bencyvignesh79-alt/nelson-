@@ -1,0 +1,67 @@
+# Required Variables
+customer_name = "acme-corp"
+github_org    = "omni-platform"
+
+# Optional: AWS Configuration
+region      = "us-east-1"
+environment = "production"
+
+# Optional: Database Configuration
+database_name               = "omni"
+database_username           = "omni"
+db_instance_class           = "db.t3.micro"
+db_allocated_storage        = 20
+db_backup_retention_period  = 7
+db_multi_az                 = false
+db_deletion_protection      = false
+skip_final_snapshot         = false
+
+# Optional: Cache Configuration
+redis_node_type     = "cache.t3.micro"
+redis_engine_version = "7.1"
+
+# Optional: ECS Configuration
+ecs_task_cpu      = "512"
+ecs_task_memory   = "1024"
+ecs_desired_count = 1
+
+# Optional: Load Balancer Configuration
+# ssl_certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/..."
+alb_deletion_protection = false
+
+# Optional: Monitoring Configuration
+log_retention_days = 30
+
+# Optional: AI Service Configuration (embedding provider is configured in the UI)
+# embedding_model         = "jina-embeddings-v3"
+# embedding_max_model_len = "8192"
+# ai_workers              = "1"
+
+# Optional: Searcher Configuration
+# semantic_search_timeout_ms = "1000"
+# rag_context_window         = "2"
+
+# Optional: Connector Manager Configuration
+# max_concurrent_syncs            = "10"
+# max_concurrent_syncs_per_type   = "3"
+# scheduler_poll_interval_seconds = "60"
+# stale_sync_timeout_minutes      = "10"
+
+# Optional: Google Connector Configuration
+# google_max_age_days                    = "730"
+# webhook_renewal_check_interval_seconds = "3600"
+
+# Optional: Slack Connector Configuration
+# slack_max_age_days                     = "730"
+
+# Optional: Common Service Configuration
+# rust_log                   = "info"
+# db_max_connections         = "10"
+# db_acquire_timeout_seconds = "3"
+# session_cookie_name        = "auth-session"
+# session_duration_days      = "7"
+# ai_answer_enabled          = "true"
+# agents_enabled             = "false"
+
+# Optional: Networking Configuration
+vpc_cidr = "10.0.0.0/16"

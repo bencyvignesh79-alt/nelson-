@@ -1,0 +1,67 @@
+use crate::config::DatabaseConfig;
+use crate::db::error::DatabaseError;
+use sqlx::{PgPool, postgres::PgPoolOptions};
+use std::time::Duration;
+
+#[derive(Clone)]
+pub struct DatabasePool {
+    pool: PgPool,
+    database_url: String,
+}
+
+impl DatabasePool {
+    pub async fn new(database_url: &str) -> Result<Self, DatabaseError> {
+        let pool = PgPoolOptions::new()
+            .max_connections(10)
+            .acquire_timeout(Duration::from_secs(3))
+            .connect(database_url)
+            .await?;
+
+        Ok(Self {
+            pool,
+            database_url: database_url.to_string(),
+        })
+    }
+
+    pub async fn new_with_options(
+        database_url: &str,
+        max_connections: u32,
+        timeout_seconds: u64,
+    ) -> Result<Self, DatabaseError> {
+        let pool = PgPoolOptions::new()
+            .max_connections(max_connections)
+            .acquire_timeout(Duration::from_secs(timeout_seconds))
+            .connect(database_url)
+            .await?;
+
+        Ok(Self {
+            pool,
+            database_url: database_url.to_string(),
+        })
+    }
+
+    pub async fn from_config(config: &DatabaseConfig) -> Result<Self, DatabaseError> {
+        let pool = PgPoolOptions::new()
+            .max_connections(config.max_connections)
+            .acquire_timeout(Duration::from_secs(config.acquire_timeout_seconds))
+            .connect(&config.database_url)
+            .await?;
+
+        Ok(Self {
+            pool,
+            database_url: config.database_url.clone(),
+        })
+    }
+
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    pub fn database_url(&self) -> &str {
+        &self.database_url
+    }
+
+    pub async fn close(&self) {
+        self.pool.close().await;
+    }
+}

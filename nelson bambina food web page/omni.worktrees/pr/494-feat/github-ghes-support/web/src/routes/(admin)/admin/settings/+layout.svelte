@@ -1,0 +1,221 @@
+<script lang="ts">
+    import * as Sidebar from '$lib/components/ui/sidebar'
+    import SidebarNavigationClose from '$lib/components/sidebar-navigation-close.svelte'
+    import type { Snippet } from 'svelte'
+    import { cn } from '$lib/utils'
+    import { page } from '$app/state'
+    import {
+        ArrowLeft,
+        Cable,
+        Users,
+        Shield,
+        Cpu,
+        ArrowUpRight,
+        Bot,
+        Mail,
+        FileText,
+        Brain,
+        Globe,
+    } from '@lucide/svelte'
+    import Button from '$lib/components/ui/button/button.svelte'
+    import SidebarUserMenu from '$lib/components/sidebar-user-menu.svelte'
+    import type { LayoutData } from './$types.js'
+
+    interface Props {
+        data: LayoutData
+        children: Snippet
+    }
+
+    let { data, children }: Props = $props()
+
+    // logout is handled inside SidebarUserMenu
+</script>
+
+<Sidebar.Provider>
+    <SidebarNavigationClose />
+    <Sidebar.Root variant="floating" collapsible="offcanvas" class="h-svh shrink-0 border-r">
+        <Sidebar.Header class="flex justify-start">
+            <Button
+                variant="ghost"
+                href="/"
+                class="text-muted-foreground flex w-fit cursor-pointer justify-start text-sm">
+                <ArrowLeft class="h-4 w-4" />
+                Back
+            </Button>
+        </Sidebar.Header>
+        <Sidebar.Content>
+            <Sidebar.Group>
+                <Sidebar.GroupLabel>Account</Sidebar.GroupLabel>
+                <Sidebar.GroupContent>
+                    <Sidebar.Menu>
+                        <Sidebar.MenuItem>
+                            <Sidebar.MenuButton
+                                class={cn(
+                                    page.url.pathname === '/admin/settings/integrations' &&
+                                        'bg-sidebar-accent text-sidebar-accent-foreground',
+                                )}>
+                                {#snippet child({ props })}
+                                    <a href="/admin/settings/integrations" {...props}>
+                                        <Cable class="h-4 w-4" />
+                                        <span>Integrations</span>
+                                    </a>
+                                {/snippet}
+                            </Sidebar.MenuButton>
+                        </Sidebar.MenuItem>
+                        <Sidebar.MenuItem>
+                            <Sidebar.MenuButton
+                                class={cn(
+                                    page.url.pathname === '/admin/settings/user-management' &&
+                                        'bg-sidebar-accent text-sidebar-accent-foreground',
+                                )}>
+                                {#snippet child({ props })}
+                                    <a href="/admin/settings/user-management" {...props}>
+                                        <Users class="h-4 w-4" />
+                                        <span>User Management</span>
+                                    </a>
+                                {/snippet}
+                            </Sidebar.MenuButton>
+                        </Sidebar.MenuItem>
+                        <Sidebar.MenuItem>
+                            <Sidebar.MenuButton
+                                class={cn(
+                                    page.url.pathname === '/admin/settings/authentication' &&
+                                        'bg-sidebar-accent text-sidebar-accent-foreground',
+                                )}>
+                                {#snippet child({ props })}
+                                    <a href="/admin/settings/authentication" {...props}>
+                                        <Shield class="h-4 w-4" />
+                                        <span>Authentication</span>
+                                    </a>
+                                {/snippet}
+                            </Sidebar.MenuButton>
+                        </Sidebar.MenuItem>
+                        <Sidebar.MenuItem>
+                            <Sidebar.MenuButton
+                                class={cn(
+                                    page.url.pathname === '/admin/settings/llm' &&
+                                        'bg-sidebar-accent text-sidebar-accent-foreground',
+                                )}>
+                                {#snippet child({ props })}
+                                    <a href="/admin/settings/llm" {...props}>
+                                        <Cpu class="h-4 w-4" />
+                                        <span>LLM Providers</span>
+                                    </a>
+                                {/snippet}
+                            </Sidebar.MenuButton>
+                        </Sidebar.MenuItem>
+                        <Sidebar.MenuItem>
+                            <Sidebar.MenuButton
+                                class={cn(
+                                    page.url.pathname === '/admin/settings/embeddings' &&
+                                        'bg-sidebar-accent text-sidebar-accent-foreground',
+                                )}>
+                                {#snippet child({ props })}
+                                    <a href="/admin/settings/embeddings" {...props}>
+                                        <ArrowUpRight class="h-4 w-4" />
+                                        <span>Embedding Providers</span>
+                                    </a>
+                                {/snippet}
+                            </Sidebar.MenuButton>
+                        </Sidebar.MenuItem>
+                        <Sidebar.MenuItem>
+                            <Sidebar.MenuButton
+                                class={cn(
+                                    page.url.pathname === '/admin/settings/email' &&
+                                        'bg-sidebar-accent text-sidebar-accent-foreground',
+                                )}>
+                                {#snippet child({ props })}
+                                    <a href="/admin/settings/email" {...props}>
+                                        <Mail class="h-4 w-4" />
+                                        <span>Email</span>
+                                    </a>
+                                {/snippet}
+                            </Sidebar.MenuButton>
+                        </Sidebar.MenuItem>
+                        <Sidebar.MenuItem>
+                            <Sidebar.MenuButton
+                                class={cn(
+                                    page.url.pathname === '/admin/settings/web-search' &&
+                                        'bg-sidebar-accent text-sidebar-accent-foreground',
+                                )}>
+                                {#snippet child({ props })}
+                                    <a href="/admin/settings/web-search" {...props}>
+                                        <Globe class="h-4 w-4" />
+                                        <span>Web Providers</span>
+                                    </a>
+                                {/snippet}
+                            </Sidebar.MenuButton>
+                        </Sidebar.MenuItem>
+                        {#if data.doclingEnabled}
+                            <Sidebar.MenuItem>
+                                <Sidebar.MenuButton
+                                    class={cn(
+                                        page.url.pathname ===
+                                            '/admin/settings/document-conversion' &&
+                                            'bg-sidebar-accent text-sidebar-accent-foreground',
+                                    )}>
+                                    {#snippet child({ props })}
+                                        <a href="/admin/settings/document-conversion" {...props}>
+                                            <FileText class="h-4 w-4" />
+                                            <span>Document Conversion</span>
+                                        </a>
+                                    {/snippet}
+                                </Sidebar.MenuButton>
+                            </Sidebar.MenuItem>
+                        {/if}
+                        {#if data.memoryEnabled}
+                            <Sidebar.MenuItem>
+                                <Sidebar.MenuButton
+                                    class={cn(
+                                        page.url.pathname === '/admin/settings/memory' &&
+                                            'bg-sidebar-accent text-sidebar-accent-foreground',
+                                    )}>
+                                    {#snippet child({ props })}
+                                        <a href="/admin/settings/memory" {...props}>
+                                            <Brain class="h-4 w-4" />
+                                            <span>Memory</span>
+                                        </a>
+                                    {/snippet}
+                                </Sidebar.MenuButton>
+                            </Sidebar.MenuItem>
+                        {/if}
+                        {#if data.agentsEnabled}
+                            <Sidebar.MenuItem>
+                                <Sidebar.MenuButton
+                                    class={cn(
+                                        page.url.pathname === '/admin/settings/agents' &&
+                                            'bg-sidebar-accent text-sidebar-accent-foreground',
+                                    )}>
+                                    {#snippet child({ props })}
+                                        <a href="/admin/settings/agents" {...props}>
+                                            <Bot class="h-4 w-4" />
+                                            <span>Org Agents</span>
+                                        </a>
+                                    {/snippet}
+                                </Sidebar.MenuButton>
+                            </Sidebar.MenuItem>
+                        {/if}
+                    </Sidebar.Menu>
+                </Sidebar.GroupContent>
+            </Sidebar.Group>
+        </Sidebar.Content>
+        <Sidebar.Footer>
+            <SidebarUserMenu
+                email={data.user.email}
+                isAdmin={data.user.role === 'admin'}
+                memoryEnabled={data.memoryEnabled} />
+        </Sidebar.Footer>
+    </Sidebar.Root>
+
+    <!-- Main content area -->
+    <div class="flex max-h-[100svh] min-h-screen w-full flex-col">
+        <header
+            class="bg-background sticky top-0 z-50 flex h-14 items-center border-b px-4 md:hidden">
+            <Sidebar.Trigger class="size-11 cursor-pointer" />
+            <span class="ml-2 text-sm font-medium">Admin Settings</span>
+        </header>
+        <main class="min-h-0 flex-1 overflow-y-auto">
+            {@render children()}
+        </main>
+    </div>
+</Sidebar.Provider>

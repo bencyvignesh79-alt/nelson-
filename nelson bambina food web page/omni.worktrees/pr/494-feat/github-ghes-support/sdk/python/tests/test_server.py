@@ -1,0 +1,668 @@
+"""Tests for the FastAPI server endpoints."""
+
+from datetime import UTC
+from typing import Any
+from unittest.mock import patch
+
+import pytest
+from fastapi.responses import JSONResponse
+from fastapi.testclient import TestClient
+
+from omni_connector import (
+    ActionDefinition,
+    ActionResponse,
+    Connector,
+    Document,
+    SdkSourceSyncData,
+    SyncContext,
+)
+from omni_connector.server import create_app
+
+
+class MockConnector(Connector):
+    """A test connector for testing the server."""
+
+    def __init__(self):
+        super().__init__()
+        self.sync_called = False
+        self.sync_args: tuple | None = None
+        self.action_called = False
+        self.action_args: tuple | None = None
+
+    @property
+    def name(self) -> str:
+        return "test-connector"
+
+    @property
+    def version(self) -> str:
+        return "1.2.3"
+
+    @property
+    def source_types(self) -> list[str]:
+        return ["test"]
+
+    @property
+    def sync_modes(self) -> list[str]:
+        return ["full", "incremental"]
+
+    @property
+    def actions(self) -> list[ActionDefinition]:
+        return [
+            ActionDefinition(
+                name="test_action",
+                description="A test action",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "param1": {"type": "string"},
+                        "param2": {"type": "number"},
+                    },
+                    "required": ["param1"],
+                },
+            ),
+        ]
+
+    async def sync(
+        self,
+        source_config: dict[str, Any],
+        credentials: dict[str, Any],
+        checkpoint: dict[str, Any] | None,
+        ctx: SyncContext,
+    ) -> None:
+        self.sync_called = True
+        self.sync_args = (source_config, credentials, checkpoint)
+        # Simulate emitting a document
+        await ctx.emit(
+            Document(
+                external_id="test-doc",
+                title="Test Document",
+                content_id="content-123",
+            )
+        )
+        await ctx.complete(checkpoint={"synced": True})
+
+    async def execute_action(
+        self,
+        action: str,
+        params: dict[str, Any],
+        credentials: dict[str, Any],
+        source: object | None = None,
+        actor_email: str | None = None,
+    ) -> JSONResponse:
+        self.action_called = True
+        self.action_args = (action, params, credentials)
+
+        if action == "test_action":
+            return JSONResponse(
+                content=ActionResponse.success(
+                    {"result": "action completed"}
+                ).model_dump()
+            )
+        return ActionResponse.not_supported(action).to_response(status_code=404)
+
+
+@pytest.fixture
+def mock_connector():
+    return MockConnector()
+
+
+@pytest.fixture
+def client(mock_connector, monkeypatch):
+    monkeypatch.setenv("CONNECTOR_MANAGER_URL", "http://localhost:9000")
+    monkeypatch.setenv("CONNECTOR_HOST_NAME", "localhost")
+    monkeypatch.setenv("PORT", "8000")
+    app = create_app(mock_connector)
+    return TestClient(app)
+
+
+class TestHealthEndpoint:
+    def test_health_returns_status(self, client):
+        response = client.get("/health")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "healthy"
+        assert data["service"] == "test-connector"
+
+
+class TestManifestEndpoint:
+    def test_manifest_returns_connector_info(self, client):
+        response = client.get("/manifest")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["name"] == "test-connector"
+        assert data["version"] == "1.2.3"
+        assert data["sync_modes"] == ["full", "incremental"]
+
+    def test_manifest_includes_actions(self, client):
+        response = client.get("/manifest")
+
+        data = response.json()
+        assert len(data["actions"]) == 1
+
+        action = data["actions"][0]
+        assert action["name"] == "test_action"
+        assert action["description"] == "A test action"
+        assert "param1" in action["input_schema"]["properties"]
+        assert action["input_schema"]["properties"]["param1"]["type"] == "string"
+        assert "param1" in action["input_schema"]["required"]
+
+
+class TestMcpSourceRequests:
+    def test_resource_and_prompt_requests_pass_typed_source(
+        self, client, mock_connector, monkeypatch
+    ):
+        class Adapter:
+            async def read_resource(self, uri, **kwargs):
+                assert uri == "mcp://resource"
+                assert kwargs == {"headers": {"Authorization": "Bearer token"}}
+                return {"contents": []}
+
+            async def get_prompt(self, name, arguments, **kwargs):
+                assert name == "provider_prompt"
+                assert arguments == {"value": "x"}
+                assert kwargs == {"headers": {"Authorization": "Bearer token"}}
+                return {"messages": []}
+
+        adapter = Adapter()
+        monkeypatch.setattr(
+            mock_connector,
+            "mcp_adapter_for_credentials",
+            lambda credentials, source: adapter if source is not None else None,
+        )
+        monkeypatch.setattr(
+            mock_connector,
+            "_prepare_mcp_auth",
+            lambda credentials: {"headers": {"Authorization": "Bearer token"}},
+        )
+        source = {
+            "id": "source-1",
+            "name": "Test Source",
+            "source_type": "test",
+            "config": {},
+            "is_active": True,
+            "is_deleted": False,
+            "scope": "org",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "created_by": "user-1",
+        }
+
+        resource_response = client.post(
+            "/resource",
+            json={
+                "uri": "mcp://resource",
+                "source": source,
+                "credentials": {"access_token": "token"},
+            },
+        )
+        prompt_response = client.post(
+            "/prompt",
+            json={
+                "name": "provider_prompt",
+                "arguments": {"value": "x"},
+                "source": source,
+                "credentials": {"access_token": "token"},
+            },
+        )
+
+        assert resource_response.status_code == 200
+        assert prompt_response.status_code == 200
+
+
+class TestCancelEndpoint:
+    @patch("omni_connector.client.SdkClient.fetch_source_sync_data")
+    def test_cancel_releases_slot_even_when_task_does_not_exit(
+        self, mock_fetch, monkeypatch
+    ):
+        """Cancel frees the source slot even if the old sync ignores cancellation."""
+        import asyncio
+        import threading
+        import time
+
+        monkeypatch.setenv("CONNECTOR_MANAGER_URL", "http://localhost:9000")
+        monkeypatch.setenv("CONNECTOR_HOST_NAME", "localhost")
+        monkeypatch.setenv("PORT", "8000")
+
+        sync_started = threading.Event()
+        release_old_sync = threading.Event()
+
+        class StuckConnector(Connector):
+            def __init__(self):
+                super().__init__()
+                self.sync_calls = 0
+
+            @property
+            def name(self) -> str:
+                return "stuck"
+
+            @property
+            def version(self) -> str:
+                return "1.0.0"
+
+            @property
+            def source_types(self) -> list[str]:
+                return ["stuck"]
+
+            async def sync(self, source_config, credentials, checkpoint, ctx):
+                self.sync_calls += 1
+                if self.sync_calls == 1:
+                    sync_started.set()
+                    while not release_old_sync.is_set():
+                        await asyncio.sleep(0.01)
+                return None
+
+        mock_fetch.return_value = SdkSourceSyncData(
+            config={},
+            credentials={},
+            connector_state=None,
+        )
+
+        connector = StuckConnector()
+        app = create_app(connector)
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/sync",
+                json={
+                    "sync_run_id": "stuck-sync",
+                    "source_id": "src-stuck",
+                    "sync_mode": "full",
+                },
+            )
+            assert response.status_code == 200
+            assert sync_started.wait(timeout=2.0)
+
+            response = client.post(
+                "/sync",
+                json={
+                    "sync_run_id": "conflicting-sync",
+                    "source_id": "src-stuck",
+                    "sync_mode": "full",
+                },
+            )
+            assert response.status_code == 409
+
+            response = client.post("/cancel", json={"sync_run_id": "stuck-sync"})
+            assert response.status_code == 200
+            assert response.json()["status"] == "cancelled"
+            assert client.get("/sync/stuck-sync").json() == {"running": False}
+
+            response = client.post(
+                "/sync",
+                json={
+                    "sync_run_id": "after-cancel",
+                    "source_id": "src-stuck",
+                    "sync_mode": "full",
+                },
+            )
+            assert response.status_code == 200
+
+            for _ in range(200):
+                if connector.sync_calls >= 2:
+                    break
+                time.sleep(0.01)
+            assert connector.sync_calls >= 2
+            release_old_sync.set()
+
+    def test_cancel_not_found(self, client):
+        """Cancel returns not_found when no matching sync is running."""
+        response = client.post(
+            "/cancel",
+            json={"sync_run_id": "nonexistent-sync"},
+        )
+
+        assert response.status_code == 404
+        data = response.json()
+        assert data["status"] == "not_found"
+
+
+class TestSyncStatusEndpoint:
+    def test_sync_status_not_running(self, client):
+        """Returns running=false when sync_run_id is unknown."""
+        response = client.get("/sync/unknown-run")
+        assert response.status_code == 200
+        assert response.json() == {"running": False}
+
+    @patch("omni_connector.client.SdkClient.fetch_source_sync_data")
+    def test_sync_status_running_then_finished(self, mock_fetch, monkeypatch):
+        """Returns running=true while sync is in flight, false after it finishes."""
+        import asyncio
+        import threading
+
+        monkeypatch.setenv("CONNECTOR_MANAGER_URL", "http://localhost:9000")
+        monkeypatch.setenv("CONNECTOR_HOST_NAME", "localhost")
+        monkeypatch.setenv("PORT", "8000")
+
+        sync_started = threading.Event()
+        sync_can_finish = threading.Event()
+
+        class BlockingConnector(Connector):
+            @property
+            def name(self) -> str:
+                return "blocking"
+
+            @property
+            def version(self) -> str:
+                return "1.0.0"
+
+            @property
+            def source_types(self) -> list[str]:
+                return ["blocking"]
+
+            async def sync(self, source_config, credentials, checkpoint, ctx):
+                sync_started.set()
+                while not sync_can_finish.is_set():
+                    await asyncio.sleep(0.01)
+                await ctx.complete()
+
+        mock_fetch.return_value = SdkSourceSyncData(
+            config={},
+            credentials={},
+            connector_state=None,
+        )
+
+        app = create_app(BlockingConnector())
+
+        with TestClient(app) as client:
+            client.post(
+                "/sync",
+                json={
+                    "sync_run_id": "sync-status-1",
+                    "source_id": "src-status",
+                    "sync_mode": "full",
+                },
+            )
+            sync_started.wait(timeout=2.0)
+
+            response = client.get("/sync/sync-status-1")
+            assert response.status_code == 200
+            assert response.json() == {"running": True}
+
+            sync_can_finish.set()
+
+            # Allow background task to complete
+            import time
+
+            for _ in range(200):
+                if client.get("/sync/sync-status-1").json()["running"] is False:
+                    break
+                time.sleep(0.01)
+
+            response = client.get("/sync/sync-status-1")
+            assert response.json() == {"running": False}
+
+
+class TestActionEndpoint:
+    def test_action_executes_successfully(self, client, mock_connector):
+        response = client.post(
+            "/action",
+            json={
+                "action": "test_action",
+                "params": {"param1": "value1", "param2": 42},
+                "credentials": {"token": "secret"},
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "success"
+        assert data["result"] == {"result": "action completed"}
+
+        # Verify the connector received the correct args
+        assert mock_connector.action_called is True
+        action, params, credentials = mock_connector.action_args
+        assert action == "test_action"
+        assert params == {"param1": "value1", "param2": 42}
+        assert credentials == {"token": "secret"}
+
+    def test_action_not_supported(self, client):
+        response = client.post(
+            "/action",
+            json={
+                "action": "unknown_action",
+                "params": {},
+                "credentials": {},
+            },
+        )
+
+        assert response.status_code == 404
+        data = response.json()
+        assert data["status"] == "error"
+        assert "not supported" in data["error"]
+
+
+class TestSyncEndpoint:
+    @patch("omni_connector.client.SdkClient.fetch_source_sync_data")
+    def test_sync_returns_started(
+        self, mock_fetch, client, mock_connector, monkeypatch
+    ):
+        """Verify sync endpoint returns immediately with 'started' status."""
+        monkeypatch.setenv("CONNECTOR_MANAGER_URL", "http://localhost:9000")
+
+        mock_fetch.return_value = SdkSourceSyncData(
+            config={"folder_id": "123"},
+            credentials={"access_token": "token"},
+            connector_state={"cursor": "abc"},
+        )
+
+        response = client.post(
+            "/sync",
+            json={
+                "sync_run_id": "sync-123",
+                "source_id": "source-456",
+                "sync_mode": "full",
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "started"
+
+    @patch("omni_connector.client.SdkClient.fetch_source_sync_data")
+    def test_sync_conflict_when_already_running(self, mock_fetch, monkeypatch):
+        """Verify 409 when sync is already in progress for source."""
+        import asyncio
+        import threading
+
+        monkeypatch.setenv("CONNECTOR_MANAGER_URL", "http://localhost:9000")
+        monkeypatch.setenv("CONNECTOR_HOST_NAME", "localhost")
+        monkeypatch.setenv("PORT", "8000")
+
+        sync_started = threading.Event()
+        sync_can_finish = threading.Event()
+
+        class BlockingConnector(Connector):
+            @property
+            def name(self) -> str:
+                return "blocking"
+
+            @property
+            def version(self) -> str:
+                return "1.0.0"
+
+            @property
+            def source_types(self) -> list[str]:
+                return ["blocking"]
+
+            async def sync(self, source_config, credentials, checkpoint, ctx):
+                sync_started.set()
+                while not sync_can_finish.is_set():
+                    await asyncio.sleep(0.01)
+                await ctx.complete()
+
+        mock_fetch.return_value = SdkSourceSyncData(
+            config={},
+            credentials={},
+            connector_state=None,
+        )
+
+        app = create_app(BlockingConnector())
+
+        with TestClient(app) as client:
+            response1 = client.post(
+                "/sync",
+                json={
+                    "sync_run_id": "sync-1",
+                    "source_id": "source-same",
+                    "sync_mode": "full",
+                },
+            )
+            assert response1.status_code == 200
+
+            sync_started.wait(timeout=2.0)
+
+            realtime_response = client.post(
+                "/sync",
+                json={
+                    "sync_run_id": "sync-realtime",
+                    "source_id": "source-same",
+                    "sync_mode": "realtime",
+                },
+            )
+            assert realtime_response.status_code == 200
+
+            response2 = client.post(
+                "/sync",
+                json={
+                    "sync_run_id": "sync-2",
+                    "source_id": "source-same",
+                    "sync_mode": "incremental",
+                },
+            )
+            assert response2.status_code == 409
+            assert "already in progress" in response2.json()["message"]
+
+            sync_can_finish.set()
+
+    @patch("omni_connector.client.SdkClient.fetch_source_sync_data")
+    def test_sync_error_when_source_not_found(self, mock_fetch, client, monkeypatch):
+        """Verify error when source doesn't exist."""
+        from omni_connector.exceptions import SdkClientError
+
+        monkeypatch.setenv("CONNECTOR_MANAGER_URL", "http://localhost:9000")
+
+        mock_fetch.side_effect = SdkClientError(
+            "Failed to fetch source config: 404 - Source not found: bad-source"
+        )
+
+        response = client.post(
+            "/sync",
+            json={
+                "sync_run_id": "sync-123",
+                "source_id": "bad-source",
+                "sync_mode": "full",
+            },
+        )
+
+        assert response.status_code == 404
+        assert "not found" in response.json()["message"].lower()
+
+
+class TestConnectorBaseClass:
+    async def test_connector_get_manifest(self, mock_connector):
+        """Verify get_manifest() returns proper structure."""
+        manifest = await mock_connector.get_manifest(connector_url="http://test:8000")
+
+        assert manifest.name == "test-connector"
+        assert manifest.version == "1.2.3"
+        assert manifest.sync_modes == ["full", "incremental"]
+        assert len(manifest.actions) == 1
+
+    def test_connector_cancel_adds_to_set(self, mock_connector):
+        """Verify cancel() tracks the sync_run_id."""
+        result = mock_connector.cancel("sync-to-cancel")
+
+        assert result is True
+        assert "sync-to-cancel" in mock_connector._cancelled_syncs
+
+    def test_connector_default_actions_empty(self):
+        """Verify default actions is empty list."""
+
+        class MinimalConnector(Connector):
+            @property
+            def name(self) -> str:
+                return "minimal"
+
+            @property
+            def version(self) -> str:
+                return "0.0.1"
+
+            @property
+            def source_types(self) -> list[str]:
+                return ["minimal"]
+
+            async def sync(self, *args, **kwargs) -> None:
+                pass
+
+        connector = MinimalConnector()
+        assert connector.actions == []
+        assert connector.sync_modes == ["full"]
+
+
+class TestOauthValidateEndpoint:
+    def _source_payload(self) -> dict[str, Any]:
+        from datetime import datetime
+
+        now = datetime.now(UTC)
+        return {
+            "id": "src-1",
+            "name": "Test Source",
+            "source_type": "test",
+            "config": {},
+            "is_active": True,
+            "is_deleted": False,
+            "scope": "org",
+            "created_at": now.isoformat(),
+            "updated_at": now.isoformat(),
+            "created_by": "user-1",
+        }
+
+    def _request_body(self) -> dict[str, Any]:
+        return {
+            "source_id": "src-1",
+            "provider": "test",
+            "credentials": {"token": "t"},
+            "flow": "org_source",
+            "metadata": {},
+            "source": self._source_payload(),
+        }
+
+    def test_default_noop_returns_empty_binding(self, client):
+        response = client.post("/oauth/validate", json=self._request_body())
+
+        assert response.status_code == 200
+        assert response.json() == {"source_binding": None}
+
+    def test_connector_binding_is_returned(self, mock_connector, monkeypatch):
+        async def validate(source, credentials, flow, metadata):
+            return {"organization_id": "00D123"}
+
+        mock_connector.validate_oauth_credential = validate
+        monkeypatch.setenv("CONNECTOR_MANAGER_URL", "http://localhost:9000")
+        monkeypatch.setenv("CONNECTOR_HOST_NAME", "localhost")
+        monkeypatch.setenv("PORT", "8000")
+        client = TestClient(create_app(mock_connector))
+
+        response = client.post("/oauth/validate", json=self._request_body())
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "source_binding": {"organization_id": "00D123"}
+        }
+
+    def test_connector_rejection_returns_400(self, mock_connector, monkeypatch):
+        async def validate(source, credentials, flow, metadata):
+            raise ValueError("OAuth organization does not match the source")
+
+        mock_connector.validate_oauth_credential = validate
+        monkeypatch.setenv("CONNECTOR_MANAGER_URL", "http://localhost:9000")
+        monkeypatch.setenv("CONNECTOR_HOST_NAME", "localhost")
+        monkeypatch.setenv("PORT", "8000")
+        client = TestClient(create_app(mock_connector))
+
+        response = client.post("/oauth/validate", json=self._request_body())
+
+        assert response.status_code == 400
+        assert "organization" in response.json()["error"]

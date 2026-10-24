@@ -1,0 +1,39 @@
+"""Typed application state for FastAPI app.state"""
+
+import asyncio
+from dataclasses import dataclass, field
+from datetime import datetime
+
+import redis.asyncio as aioredis
+
+from embeddings import EmbeddingProvider
+from provider_cache import ProviderCache
+from tools import SearcherTool
+from storage import ContentStorage
+from memory.provider import MemoryProvider
+from web_providers import WebFetchProvider, WebSearchProvider
+
+
+@dataclass
+class AppState:
+    """Typed application state for FastAPI app.state.
+
+    This class provides proper type hints for IDE autocompletion
+    when accessing app.state attributes.
+    """
+
+    embedding_provider: EmbeddingProvider | None = None
+    embedding_provider_type: str | None = None
+    embedding_provider_id: str | None = None
+    embedding_provider_updated_at: datetime | None = None
+    provider_cache: ProviderCache = field(default_factory=ProviderCache)
+    searcher_tool: SearcherTool | None = None
+    web_search_provider: WebSearchProvider | None = None
+    web_search_provider_type: str | None = None
+    web_fetch_provider: WebFetchProvider | None = None
+    web_fetch_provider_type: str | None = None
+    content_storage: ContentStorage | None = None
+    redis_client: aioredis.Redis | None = None
+    listener_task: asyncio.Task | None = None
+    agent_run_queues: dict = field(default_factory=dict)  # {run_id: asyncio.Queue}
+    memory_provider: MemoryProvider | None = None

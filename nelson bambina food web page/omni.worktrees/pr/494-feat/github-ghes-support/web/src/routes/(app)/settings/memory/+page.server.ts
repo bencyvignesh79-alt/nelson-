@@ -1,0 +1,174 @@
+import { error, redirect, fail } from '@sveltejs/kit'
+import { env } from '$env/dynamic/private'
+import { getConfig } from '$lib/server/config'
+import {
+    GLOBAL_CONFIGURATION_KEYS,
+    getTypedGlobal,
+    type MemoryMode,
+} from '$lib/server/db/configuration'
+import { deleteUserMemoryMode, setUserMemoryMode } from '$lib/server/db/userConfiguration'
+import { getCurrentProvider } from '$lib/server/db/embedding-providers'
+import type { PageServerLoad, Actions } from './$types'
+
+function requireMemoryEnabled() {
+    if (env.MEMORY_ENABLED !== 'true') throw error(404)
+}
+
+const MODE_RANK: Record<MemoryMode, number> = { off: 0, chat: 1, full: 2 }
+const VALID_MODES = ['off', 'chat', 'full', ''] as const
+
+type StoredMemory = { id: string; memory: string; created_at?: string }
+
+function isMemoryMode(mode: string): mode is MemoryMode {
+    return mode === 'off' || mode === 'chat' || mode === 'full'
+}
+
+function isSubmittedMode(mode: string): mode is MemoryMode | '' {
+    return VALID_MODES.includes(mode as (typeof VALID_MODES)[number])
+}
+
+function isAllowed(candidate: MemoryMode | '', ceiling: MemoryMode): boolean {
+    if (candidate === '') return true
+    return MODE_RANK[candidate] <= MODE_RANK[ceiling]
+}
+
+async function fetchMemories(userId: string): Promise<StoredMemory[]> {
+    const { services } = getConfig()
+    try {
+        const resp = await fetch(`${services.aiServiceUrl}/memories`, {
+            headers: { 'x-user-id': userId },
+        })
+        if (!resp.ok) return []
+        const data = (await resp.json()) as { memories?: StoredMemory[] }
+        return data.memories ?? []
+    } catch (err) {
+        console.error('Failed to fetch memories:', err)
+        return []
+    }
+}
+
+export const load: PageServerLoad = async ({ locals }) => {
+    if (!locals.user) {
+        throw redirect(302, '/login')
+    }
+    requireMemoryEnabled()
+
+    const [orgDefaultConfig, embedder, memories] = await Promise.all([
+        getTypedGlobal(GLOBAL_CONFIGURATION_KEYS.MEMORY_MODE_DEFAULT),
+        getCurrentProvider(),
+        fetchMemories(locals.user.id),
+    ])
+    const orgDefault = orgDefaultConfig?.value ?? 'off'
+
+    return {
+        currentMode: locals.user.memoryMode ?? null,
+        orgDefault,
+        embedderAvailable: embedder !== null,
+        memories,
+    }
+}
+
+export const actions: Actions = {
+    save: async ({ request, locals }) => {
+        if (!locals.user) {
+            throw redirect(302, '/login')
+        }
+        requireMemoryEnabled()
+
+        const formData = await request.formData()
+        const mode = formData.get('mode') as string
+
+        if (!isSubmittedMode(mode)) {
+            return fail(400, { error: 'Invalid memory mode' })
+        }
+
+        const [orgDefaultConfig, embedder] = await Promise.all([
+            getTypedGlobal(GLOBAL_CONFIGURATION_KEYS.MEMORY_MODE_DEFAULT),
+            getCurrentProvider(),
+        ])
+        const orgDefault = orgDefaultConfig?.value ?? 'off'
+
+        if (!embedder && mode !== 'off' && mode !== '') {
+            return fail(400, {
+                error: 'Memory is unavailable until an embedding provider is configured.',
+            })
+        }
+
+        if (!isAllowed(mode, orgDefault)) {
+            return fail(400, {
+                error: `Your admin allows up to "${orgDefault}". Pick a lower or equal option.`,
+            })
+        }
+
+        try {
+            if (mode === '') {
+                await deleteUserMemoryMode(locals.user.id)
+            } else {
+                if (!isMemoryMode(mode)) {
+                    return fail(400, { error: 'Invalid memory mode' })
+                }
+                await setUserMemoryMode(locals.user.id, mode)
+            }
+            return { success: true }
+        } catch (err) {
+            console.error('Failed to update memory mode:', err)
+            return fail(500, { error: 'Failed to save preference' })
+        }
+    },
+
+    deleteOne: async ({ request, locals }) => {
+        if (!locals.user) {
+            throw redirect(302, '/login')
+        }
+        requireMemoryEnabled()
+
+        const formData = await request.formData()
+        const memoryId = (formData.get('memoryId') as string | null)?.trim()
+        if (!memoryId) {
+            return fail(400, { deleteError: 'Missing memory id' })
+        }
+
+        const { services } = getConfig()
+        try {
+            const resp = await fetch(
+                `${services.aiServiceUrl}/memories/${encodeURIComponent(memoryId)}`,
+                {
+                    method: 'DELETE',
+                    headers: { 'x-user-id': locals.user.id },
+                },
+            )
+            if (!resp.ok) {
+                return fail(resp.status === 404 ? 404 : 502, {
+                    deleteError:
+                        resp.status === 404 ? 'Memory not found' : 'Failed to delete memory',
+                })
+            }
+            return { deleted: true }
+        } catch (err) {
+            console.error('Failed to delete memory:', err)
+            return fail(502, { deleteError: 'Failed to delete memory' })
+        }
+    },
+
+    deleteAll: async ({ locals }) => {
+        if (!locals.user) {
+            throw redirect(302, '/login')
+        }
+        requireMemoryEnabled()
+
+        const { services } = getConfig()
+        try {
+            const resp = await fetch(`${services.aiServiceUrl}/memories`, {
+                method: 'DELETE',
+                headers: { 'x-user-id': locals.user.id },
+            })
+            if (!resp.ok) {
+                return fail(502, { deleteError: 'Failed to delete memories' })
+            }
+            return { deletedAll: true }
+        } catch (err) {
+            console.error('Failed to delete all memories:', err)
+            return fail(502, { deleteError: 'Failed to delete memories' })
+        }
+    },
+}

@@ -1,0 +1,54 @@
+pub mod clients;
+pub mod config;
+pub mod constants;
+pub mod content_chunker;
+pub mod content_extractor;
+pub mod content_storage;
+pub mod db;
+pub mod embedding_queue;
+pub mod encryption;
+pub mod models;
+pub mod queue;
+pub mod rate_limiter;
+pub mod service_auth;
+pub mod storage;
+pub mod task_queue;
+pub mod telemetry;
+pub mod traits;
+pub mod utils;
+
+pub mod test_utils;
+
+pub mod test_environment;
+
+pub use clients::ai::AIClient;
+pub use config::*;
+pub use content_chunker::ContentChunker;
+pub use content_storage::{ContentStorage, ContentStorageError};
+pub use db::repositories::{
+    ConfigurationRepository, ConnectorConfigRepository, DocumentRepository, EmbeddingRepository,
+    GroupRepository, PersonRepository, PersonSearchFilter, PersonSearchResult, PersonSyncResult,
+    PersonUpsert, ServiceCredentialsRepo, SourceRepository, TitleEntry, UserRepository,
+};
+pub use db::{DatabaseError, DatabasePool};
+pub use embedding_queue::{
+    DOCUMENT_EMBEDDING_MAX_ATTEMPTS, DOCUMENT_EMBEDDING_PAYLOAD_VERSION,
+    DOCUMENT_EMBEDDING_TASK_TYPE, EmbeddingQueue, EmbeddingQueueItem,
+};
+pub use encryption::{EncryptedData, EncryptionService};
+pub use models::*;
+pub use queue::{EventQueue, QueueStats, QueueSummary};
+pub use rate_limiter::{RateLimiter, RetryableError};
+pub use service_auth::{ServiceAuth, create_service_auth};
+pub use storage::{
+    ContentMetadata as StorageContentMetadata, ObjectStorage, StorageError,
+    factory::{StorageBackend, StorageFactory},
+};
+pub use task_queue::{
+    ClaimOptions, EnqueueTaskRequest, Task, TaskClaim, TaskQueue, TaskStats, TaskStatus,
+};
+pub use traits::Repository;
+
+pub fn init() {
+    println!("Shared library initialized");
+}

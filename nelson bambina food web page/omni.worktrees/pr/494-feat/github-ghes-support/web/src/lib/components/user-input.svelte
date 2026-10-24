@@ -1,0 +1,806 @@
+<script lang="ts">
+    import { Button } from '$lib/components/ui/button'
+    import * as Popover from '$lib/components/ui/popover'
+    import * as Select from '$lib/components/ui/select'
+    import {
+        Send,
+        Loader2,
+        CircleStop,
+        Search,
+        MessageCircle,
+        SendHorizontal,
+        FileText,
+        Paperclip,
+    } from '@lucide/svelte'
+    import { cn } from '$lib/utils'
+    import type { Component, Snippet } from 'svelte'
+    import * as ButtonGroup from '$lib/components/ui/button-group'
+    import * as Tooltip from '$lib/components/ui/tooltip'
+    import type { TypeaheadResult } from '$lib/types/search'
+    import type { MentionedDocument } from '$lib/types/message'
+    import { getDocumentIconPath } from '$lib/utils/icons'
+    import { formatProviderName } from '$lib/utils/providers.js'
+    import { hasMinimumQueryLength } from '$lib/utils/query'
+    import { filesFromClipboardData, filesFromClipboardHtml } from '$lib/attachments/clipboard'
+
+    interface PopoverItem {
+        label: string
+        icon?: Component
+        iconPath?: string
+        onClick: () => void
+    }
+
+    export interface ModelOption {
+        id: string
+        displayName: string
+        providerType: string
+        isDefault: boolean
+    }
+
+    interface UserInputProps {
+        value: string
+        inputMode: InputMode
+        onSubmit: () => void | Promise<void>
+        onInput: (value: string) => void
+        modeSelectorEnabled: boolean
+        placeholders?: Record<InputMode, string>
+        isLoading?: boolean
+        isStreaming?: boolean
+        allowSubmitWhileStreaming?: boolean
+        stopInProgress?: boolean
+        onStop?: () => void
+        disabled?: boolean
+        popoverItems?: PopoverItem[]
+        showPopover?: boolean
+        onPopoverChange?: (open: boolean) => void
+        maxWidth?: string
+        containerClass?: string
+        models?: ModelOption[]
+        selectedModelId?: string | null
+        onModelChange?: (modelId: string) => void
+        onAttachClick?: () => void
+        onFilesDropped?: (files: FileList | File[]) => void
+        attachments?: Snippet
+        mentionedDocs?: MentionedDocument[]
+        canSubmit?: boolean
+    }
+
+    export type InputMode = 'search' | 'chat'
+    const DEFAULT_PLACEHOLDERS: Record<InputMode, string> = {
+        search: 'Search...',
+        chat: 'Ask...',
+    }
+
+    let {
+        value = $bindable(''),
+        inputMode = $bindable(),
+        onSubmit,
+        onInput,
+        modeSelectorEnabled = true,
+        placeholders = DEFAULT_PLACEHOLDERS,
+        isLoading = false,
+        isStreaming = false,
+        allowSubmitWhileStreaming = false,
+        stopInProgress = false,
+        onStop,
+        disabled = false,
+        popoverItems = [],
+        showPopover = false,
+        onPopoverChange,
+        maxWidth = 'max-w-4xl',
+        containerClass = '',
+        models = [],
+        selectedModelId = null,
+        onModelChange,
+        onAttachClick,
+        onFilesDropped,
+        attachments,
+        mentionedDocs = $bindable([]),
+        canSubmit = undefined,
+    }: UserInputProps = $props()
+
+    let isDragging = $state(false)
+
+    let dragDepth = 0
+
+    function isFileDrag(e: DragEvent): boolean {
+        return !!e.dataTransfer?.types?.includes('Files')
+    }
+
+    function handleDragEnter(e: DragEvent) {
+        if (!onFilesDropped || !isFileDrag(e)) return
+        e.preventDefault()
+        dragDepth++
+        isDragging = true
+    }
+
+    function handleDragOver(e: DragEvent) {
+        if (!onFilesDropped || !isFileDrag(e)) return
+        e.preventDefault()
+        if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'
+    }
+
+    function handleDragLeave(e: DragEvent) {
+        if (!onFilesDropped || !isFileDrag(e)) return
+        e.preventDefault()
+        dragDepth = Math.max(0, dragDepth - 1)
+        if (dragDepth === 0) isDragging = false
+    }
+
+    function handleDrop(e: DragEvent) {
+        if (!onFilesDropped || !isFileDrag(e)) return
+        e.preventDefault()
+        dragDepth = 0
+        isDragging = false
+        if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
+            onFilesDropped(e.dataTransfer.files)
+        }
+    }
+
+    function handlePaste(e: ClipboardEvent) {
+        if (!onFilesDropped) return
+        const files = filesFromClipboardData(e.clipboardData)
+        if (files.length > 0) {
+            e.preventDefault()
+            onFilesDropped(files)
+            return
+        }
+        const html = e.clipboardData?.getData('text/html')
+        if (html && /<img\b/i.test(html)) {
+            // Web-image paste (Safari's default when copying an image on a
+            // page): the browser never exposes it as a file, so materialize
+            // it via the from-url proxy. Cancel the default insertion of a
+            // raw <img> into the editable regardless of the fetch outcome.
+            e.preventDefault()
+            void filesFromClipboardHtml(html).then((resolved) => {
+                if (resolved.length > 0) onFilesDropped?.(resolved)
+            })
+        }
+    }
+
+    let showModelSelector = $derived(models.length >= 2 && inputMode === 'chat')
+
+    let selectedModel = $derived(models.find((m) => m.id === selectedModelId))
+
+    let groupedModels = $derived(
+        Object.entries(
+            models.reduce<Record<string, ModelOption[]>>((acc, m) => {
+                if (!acc[m.providerType]) {
+                    acc[m.providerType] = []
+                }
+                acc[m.providerType].push(m)
+                return acc
+            }, {}),
+        ),
+    )
+
+    export function focus() {
+        inputRef?.focus()
+    }
+
+    let inputRef: HTMLDivElement
+    let popoverContainer: HTMLDivElement | undefined = $state()
+    let placeholder = $derived(placeholders[inputMode])
+
+    let effectiveEligibility = $derived.by(() => {
+        if (canSubmit !== undefined) return canSubmit
+        return value.trim().length > 0 || mentionedDocs.length > 0
+    })
+
+    // @-mention state
+    let mentionActive = $state(false)
+    let mentionQuery = $state('')
+    let mentionResults: TypeaheadResult[] = $state([])
+    let mentionHighlightIndex = $state(0)
+    let debounceTimer: ReturnType<typeof setTimeout> | undefined
+
+    // Mention anchor: the text node and offset where `@` was found
+    let mentionAnchorNode: Text | null = null
+    let mentionAnchorOffset = 0
+
+    let effectivePopoverItems: PopoverItem[] = $derived(
+        inputMode === 'chat' && mentionActive && mentionResults.length > 0
+            ? mentionResults.map((result) => ({
+                  label: result.title,
+                  icon: FileText,
+                  iconPath:
+                      getDocumentIconPath(result.source_type, result.content_type) ?? undefined,
+                  onClick: () => insertMentionChip(result),
+              }))
+            : popoverItems,
+    )
+
+    let effectiveShowPopover = $derived.by(() => {
+        if (inputMode === 'chat' && mentionActive) {
+            return mentionResults.length > 0
+        }
+        return inputMode === 'search' && showPopover
+    })
+
+    // Extract text content, stripping mention-chip text for chat mode.
+    // In search mode, chip title text is included (existing behavior).
+    function textWithoutMentionChips(): string {
+        if (!inputRef) return ''
+        if (inputMode === 'search') return inputRef.innerText
+        // Clone to avoid live DOM manipulation. Convert browser-created line
+        // breaks before reading textContent, since textContent ignores <br>.
+        const clone = inputRef.cloneNode(true) as HTMLElement
+        const chips = clone.querySelectorAll('[data-document-id]')
+        for (const chip of chips) {
+            chip.remove()
+        }
+        for (const lineBreak of clone.querySelectorAll('br')) {
+            lineBreak.replaceWith(document.createTextNode('\n'))
+        }
+        return clone.textContent ?? ''
+    }
+
+    // Sync externally controlled value/mentionedDocs to the live DOM.
+    // When the parent resets both to empty (successful submit), clear all
+    // children including chips. When chips exist but values are nonempty,
+    // leave DOM intact (parent is editing, not resetting).
+    $effect(() => {
+        if (!inputRef) return
+        if (value === '' && mentionedDocs.length === 0) {
+            // Controlled clear: parent reset after successful submit.
+            inputRef.replaceChildren()
+            return
+        }
+        const hasChips = inputRef.querySelector('[data-document-id]')
+        if (!hasChips && value !== inputRef.innerText) {
+            if (value) {
+                inputRef.innerText = value
+            } else {
+                inputRef.replaceChildren()
+            }
+        }
+    })
+
+    function scanMentionedDocs() {
+        if (inputMode !== 'chat' || !inputRef) {
+            mentionedDocs = []
+            return
+        }
+        const chips = inputRef.querySelectorAll('[data-document-id]')
+        mentionedDocs = Array.from(chips).map((chip) => {
+            const element = chip as HTMLElement
+            return {
+                document_id: element.dataset.documentId ?? '',
+                title: element.dataset.title ?? element.textContent ?? '',
+                source_type: element.dataset.sourceType,
+                content_type: element.dataset.contentType,
+            }
+        })
+    }
+
+    function closeMention() {
+        mentionActive = false
+        mentionQuery = ''
+        mentionResults = []
+        mentionHighlightIndex = 0
+        mentionAnchorNode = null
+        mentionAnchorOffset = 0
+        if (debounceTimer) {
+            clearTimeout(debounceTimer)
+            debounceTimer = undefined
+        }
+    }
+
+    function detectMention() {
+        if (inputMode !== 'chat') {
+            closeMention()
+            return
+        }
+
+        const sel = window.getSelection()
+        if (!sel || sel.rangeCount === 0) {
+            closeMention()
+            return
+        }
+
+        const range = sel.getRangeAt(0)
+        const node = range.startContainer
+        if (node.nodeType !== Node.TEXT_NODE) {
+            closeMention()
+            return
+        }
+
+        const text = node.textContent || ''
+        const cursorPos = range.startOffset
+
+        // Scan backwards from cursor for `@`. Spaces are allowed in document
+        // titles/queries (e.g. "@Asset Risk"), but mentions do not span lines.
+        let atIndex = -1
+        for (let i = cursorPos - 1; i >= 0; i--) {
+            const ch = text[i]
+            if (ch === '@') {
+                // `@` must be at start of text or preceded by whitespace
+                if (i === 0 || /\s/.test(text[i - 1])) {
+                    atIndex = i
+                }
+                break
+            }
+            if (ch === '\n') break
+        }
+
+        if (atIndex === -1) {
+            closeMention()
+            return
+        }
+
+        const query = text.slice(atIndex + 1, cursorPos)
+        mentionAnchorNode = node as Text
+        mentionAnchorOffset = atIndex
+
+        if (!hasMinimumQueryLength(query)) {
+            if (debounceTimer) clearTimeout(debounceTimer)
+            mentionActive = true
+            mentionQuery = query
+            mentionResults = []
+            return
+        }
+
+        mentionActive = true
+        mentionQuery = query
+        mentionHighlightIndex = 0
+
+        if (debounceTimer) clearTimeout(debounceTimer)
+        debounceTimer = setTimeout(() => {
+            fetchTypeahead(query)
+        }, 150)
+    }
+
+    async function fetchTypeahead(query: string) {
+        if (inputMode !== 'chat') return
+
+        try {
+            const res = await fetch(`/api/typeahead?q=${encodeURIComponent(query)}&limit=5`)
+            if (!res.ok) {
+                mentionResults = []
+                return
+            }
+            const data = await res.json()
+            if (inputMode === 'chat' && mentionActive && mentionQuery === query) {
+                mentionResults = data.results || []
+                mentionHighlightIndex = 0
+            }
+        } catch {
+            mentionResults = []
+        }
+    }
+
+    function insertMentionChip(result: TypeaheadResult) {
+        if (inputMode !== 'chat' || !mentionAnchorNode || !inputRef) return
+
+        const queryEndOffset = Math.min(
+            mentionAnchorOffset + 1 + mentionQuery.length,
+            mentionAnchorNode.textContent?.length ?? mentionAnchorOffset,
+        )
+
+        // Create a range from `@` to the end of the current mention query. Do
+        // not rely on window selection here: mouse-selecting a suggestion can
+        // move focus/selection from the composer to the popover button.
+        const range = document.createRange()
+        range.setStart(mentionAnchorNode, mentionAnchorOffset)
+        range.setEnd(mentionAnchorNode, queryEndOffset)
+        range.deleteContents()
+
+        // Create the chip element
+        const chip = document.createElement('span')
+        chip.contentEditable = 'false'
+        chip.dataset.documentId = result.document_id
+        chip.dataset.title = result.title
+        chip.dataset.sourceType = result.source_type
+        chip.dataset.contentType = result.content_type
+        chip.className =
+            'bg-muted text-foreground inline-flex max-w-64 items-center gap-1.5 rounded-full border px-1.5 py-0.5 align-baseline text-sm select-none'
+
+        const iconPath = getDocumentIconPath(result.source_type, result.content_type)
+        if (iconPath) {
+            const icon = document.createElement('img')
+            icon.src = iconPath
+            icon.alt = ''
+            icon.className = 'h-3.5 w-3.5 shrink-0 object-contain'
+            chip.append(icon)
+        }
+
+        const label = document.createElement('span')
+        label.className = 'truncate'
+        label.textContent = result.title
+        chip.append(label)
+
+        // Insert chip + trailing space
+        range.insertNode(chip)
+
+        const space = document.createTextNode('\u00A0')
+        chip.after(space)
+
+        closeMention()
+        scanMentionedDocs()
+        value = textWithoutMentionChips()
+        onInput(value)
+
+        // Closing the popover can update focus. Restore the caret after the
+        // inserted chip once DOM/state updates have settled.
+        requestAnimationFrame(() => {
+            inputRef?.focus({ preventScroll: true })
+            const sel = window.getSelection()
+            if (!sel || !space.isConnected) return
+            const newRange = document.createRange()
+            newRange.setStart(space, space.length)
+            newRange.collapse(true)
+            sel.removeAllRanges()
+            sel.addRange(newRange)
+        })
+    }
+
+    function handleKeyPress(event: KeyboardEvent) {
+        if (inputMode === 'chat' && mentionActive && mentionResults.length > 0) {
+            if (event.key === 'ArrowDown') {
+                event.preventDefault()
+                mentionHighlightIndex = (mentionHighlightIndex + 1) % mentionResults.length
+                return
+            }
+            if (event.key === 'ArrowUp') {
+                event.preventDefault()
+                mentionHighlightIndex =
+                    (mentionHighlightIndex - 1 + mentionResults.length) % mentionResults.length
+                return
+            }
+            if (event.key === 'Enter') {
+                event.preventDefault()
+                insertMentionChip(mentionResults[mentionHighlightIndex])
+                return
+            }
+            if (event.key === 'Escape') {
+                event.preventDefault()
+                closeMention()
+                return
+            }
+        }
+
+        if (
+            event.key === 'Enter' &&
+            !event.shiftKey &&
+            (!isStreaming || allowSubmitWhileStreaming)
+        ) {
+            event.preventDefault()
+            handleSubmitClick()
+        }
+    }
+
+    async function handleSubmitClick() {
+        if (
+            effectiveEligibility &&
+            !disabled &&
+            !isLoading &&
+            (!isStreaming || allowSubmitWhileStreaming)
+        ) {
+            await onSubmit()
+        }
+    }
+
+    function handleStopClick() {
+        if (onStop) {
+            onStop()
+        }
+    }
+
+    function handleInputChange() {
+        if (inputRef) {
+            value = textWithoutMentionChips()
+            onInput(value)
+            scanMentionedDocs()
+            detectMention()
+            if (!mentionActive && onPopoverChange) {
+                onPopoverChange(false)
+            }
+        }
+    }
+
+    function handleFocus() {
+        if (popoverItems.length > 0 && onPopoverChange) {
+            onPopoverChange(true)
+        }
+    }
+
+    function handleBlur() {
+        // Delay to allow popover item clicks to register
+        setTimeout(() => {
+            if (!mentionActive && onPopoverChange) {
+                onPopoverChange(false)
+            }
+        }, 150)
+    }
+
+    function handlePopoverItemClick(item: PopoverItem) {
+        item.onClick()
+        if (!mentionActive && onPopoverChange) {
+            onPopoverChange(false)
+        }
+    }
+
+    function changeInputMode(newMode: InputMode) {
+        inputMode = newMode
+        if (newMode === 'search') {
+            // Remove mention chips from DOM when switching to search mode;
+            // preserve ordinary text by replacing each chip with its text.
+            if (inputRef) {
+                const chips = inputRef.querySelectorAll('[data-document-id]')
+                for (const chip of chips) {
+                    chip.replaceWith(chip.textContent || '')
+                }
+            }
+            mentionedDocs = []
+        }
+        closeMention()
+        // Recompute controlled value from current DOM for the new mode
+        // (search includes chip titles; chat excludes them).
+        value = textWithoutMentionChips()
+        scanMentionedDocs()
+        onInput(value)
+    }
+</script>
+
+{#snippet modeSelector()}
+    <Tooltip.Provider delayDuration={300}>
+        <ButtonGroup.Root>
+            <Tooltip.Root>
+                <Tooltip.Trigger>
+                    {#snippet child({ props })}
+                        <Button
+                            {...props}
+                            variant="outline"
+                            size="icon-sm"
+                            class="data-[active=true]:bg-accent data-[active=true]:text-foreground text-muted-foreground cursor-pointer"
+                            data-active={inputMode === 'chat'}
+                            aria-label="Chat mode"
+                            onclick={(e) => {
+                                e.stopPropagation()
+                                changeInputMode('chat')
+                            }}>
+                            <MessageCircle class="size-4" />
+                        </Button>
+                    {/snippet}
+                </Tooltip.Trigger>
+                <Tooltip.Content>
+                    <div class="text-center">
+                        <div class="font-semibold">Chat</div>
+                        <div class="text-xs opacity-90">Have a conversation with AI</div>
+                    </div>
+                </Tooltip.Content>
+            </Tooltip.Root>
+            <Tooltip.Root>
+                <Tooltip.Trigger>
+                    {#snippet child({ props })}
+                        <Button
+                            {...props}
+                            variant="outline"
+                            size="icon-sm"
+                            class="data-[active=true]:bg-accent data-[active=true]:text-foreground text-muted-foreground cursor-pointer"
+                            data-active={inputMode === 'search'}
+                            aria-label="Search mode"
+                            onclick={(e) => {
+                                e.stopPropagation()
+                                changeInputMode('search')
+                            }}>
+                            <Search class="size-4" />
+                        </Button>
+                    {/snippet}
+                </Tooltip.Trigger>
+                <Tooltip.Content>
+                    <div class="text-center">
+                        <div class="font-semibold">Search</div>
+                        <div class="text-xs opacity-90">
+                            Find information with AI-powered answers
+                        </div>
+                    </div>
+                </Tooltip.Content>
+            </Tooltip.Root>
+        </ButtonGroup.Root>
+    </Tooltip.Provider>
+{/snippet}
+
+<div
+    class={cn('relative w-full', maxWidth, containerClass)}
+    bind:this={popoverContainer}
+    ondragenter={handleDragEnter}
+    ondragover={handleDragOver}
+    ondragleave={handleDragLeave}
+    ondrop={handleDrop}>
+    <div
+        class={cn(
+            'omni-composer-shell bg-card relative isolate flex max-h-96 min-h-[1.5rem] w-full cursor-text flex-col gap-2 overflow-hidden border border-gray-200 p-4 shadow-sm transition-colors',
+            effectiveShowPopover && effectivePopoverItems.length > 0
+                ? 'rounded-t-xl'
+                : 'rounded-xl',
+            isDragging && 'border-primary bg-muted/50 border-2 border-dashed',
+        )}
+        onclick={() => inputRef.focus()}
+        onkeydown={handleKeyPress}
+        role="button"
+        tabindex="0">
+        {#if isDragging}
+            <div
+                class="bg-card/90 text-muted-foreground pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-xl text-sm font-medium">
+                Drop files to attach
+            </div>
+        {/if}
+        {#if attachments}
+            {@render attachments()}
+        {/if}
+        <div
+            bind:this={inputRef}
+            oninput={handleInputChange}
+            onfocus={handleFocus}
+            onblur={handleBlur}
+            onpaste={handlePaste}
+            class={cn(
+                'before:text-muted-foreground relative min-h-12 cursor-text overflow-y-auto before:pointer-events-none before:absolute before:inset-0 focus:outline-none',
+                value.trim() || mentionedDocs.length > 0
+                    ? "before:content-['']"
+                    : 'before:content-[attr(data-placeholder)]',
+            )}
+            contenteditable="true"
+            role="textbox"
+            aria-multiline="true"
+            data-placeholder={placeholder}>
+        </div>
+        <div class="flex w-full items-end justify-between">
+            <div class="flex items-center gap-2">
+                {#if modeSelectorEnabled}
+                    {@render modeSelector()}
+                {/if}
+                {#if onAttachClick && inputMode === 'chat'}
+                    <Tooltip.Provider delayDuration={300}>
+                        <Tooltip.Root>
+                            <Tooltip.Trigger>
+                                {#snippet child({ props })}
+                                    <Button
+                                        {...props}
+                                        type="button"
+                                        size="icon-sm"
+                                        variant="ghost"
+                                        class="text-muted-foreground cursor-pointer"
+                                        onclick={(e) => {
+                                            e.stopPropagation()
+                                            onAttachClick()
+                                        }}
+                                        aria-label="Attach file">
+                                        <Paperclip class="size-4" />
+                                    </Button>
+                                {/snippet}
+                            </Tooltip.Trigger>
+                            <Tooltip.Content>Attach file</Tooltip.Content>
+                        </Tooltip.Root>
+                    </Tooltip.Provider>
+                {/if}
+            </div>
+            <div class="flex w-full justify-end gap-2">
+                {#if showModelSelector}
+                    <Select.Root
+                        type="single"
+                        value={selectedModelId ?? undefined}
+                        onValueChange={(v) => {
+                            if (v && onModelChange) onModelChange(v)
+                        }}>
+                        <Select.Trigger
+                            size="sm"
+                            class="omni-composer-model hover:bg-muted text-muted-foreground h-8 max-w-[280px] min-w-0 cursor-pointer overflow-hidden border-none text-sm shadow-none"
+                            title={selectedModel?.displayName ?? 'Select model'}
+                            onclick={(e) => e.stopPropagation()}>
+                            <span class="truncate">
+                                {selectedModel?.displayName ?? 'Select model'}
+                            </span>
+                        </Select.Trigger>
+                        <Select.Content class="max-h-96 w-3xs" align="end">
+                            {#each groupedModels as [provider, providerModels]}
+                                <Select.Group>
+                                    <Select.GroupHeading>
+                                        {formatProviderName(provider)}
+                                    </Select.GroupHeading>
+                                    {#each providerModels as model}
+                                        <Select.Item
+                                            class="cursor-pointer"
+                                            value={model.id}
+                                            title={model.displayName}>
+                                            <span class="truncate">{model.displayName}</span>
+                                        </Select.Item>
+                                    {/each}
+                                </Select.Group>
+                            {/each}
+                        </Select.Content>
+                    </Select.Root>
+                {/if}
+                {#if isStreaming && (!allowSubmitWhileStreaming || !effectiveEligibility)}
+                    {#if stopInProgress}
+                        <Button
+                            size="icon"
+                            class="omni-composer-send size-8 cursor-pointer rounded-full"
+                            disabled>
+                            <Loader2 class="h-4 w-4 animate-spin" />
+                        </Button>
+                    {:else}
+                        <Button
+                            size="icon"
+                            class="omni-composer-send size-8 cursor-pointer rounded-full"
+                            onclick={handleStopClick}
+                            aria-label="Stop response">
+                            <CircleStop class="h-4 w-4" />
+                        </Button>
+                    {/if}
+                {:else if !isStreaming || allowSubmitWhileStreaming}
+                    <Button
+                        size="icon"
+                        class="omni-composer-send size-8 cursor-pointer"
+                        onclick={handleSubmitClick}
+                        disabled={!effectiveEligibility ||
+                            disabled ||
+                            isLoading ||
+                            (canSubmit !== undefined && !canSubmit)}>
+                        {#if isLoading}
+                            <Loader2 class="h-3 w-3 animate-spin" />
+                        {:else if inputMode === 'search'}
+                            <Search class="h-3 w-3" />
+                        {:else}
+                            <SendHorizontal class="h-3 w-3" />
+                        {/if}
+                    </Button>
+                {/if}
+            </div>
+        </div>
+    </div>
+
+    {#if effectivePopoverItems.length > 0}
+        <Popover.Root open={effectiveShowPopover}>
+            <Popover.Content
+                class="omni-composer-popover w-2xl rounded-b-xl p-0"
+                align="start"
+                sideOffset={-1}
+                alignOffset={-1}
+                trapFocus={false}
+                customAnchor={popoverContainer}
+                onOpenAutoFocus={(e) => {
+                    e.preventDefault()
+                }}
+                onCloseAutoFocus={(e) => {
+                    e.preventDefault()
+                }}
+                onFocusOutside={(e) => e.preventDefault()}>
+                <div class="bg-card max-w-2xl rounded-b-xl border">
+                    <div class="py-2">
+                        {#each effectivePopoverItems as item, i}
+                            <button
+                                class={cn(
+                                    'hover:bg-accent hover:text-accent-foreground focus:bg-accent focus:text-accent-foreground w-full px-4 py-2.5 text-left text-sm transition-colors focus:outline-none',
+                                    mentionActive &&
+                                        i === mentionHighlightIndex &&
+                                        'bg-accent text-accent-foreground',
+                                )}
+                                onmousedown={(event) => {
+                                    if (mentionActive) event.preventDefault()
+                                }}
+                                onclick={() => handlePopoverItemClick(item)}>
+                                <div class="flex items-center gap-3">
+                                    {#if item.iconPath}
+                                        <img
+                                            src={item.iconPath}
+                                            alt=""
+                                            class="h-4 w-4 shrink-0 object-contain" />
+                                    {:else if item.icon}
+                                        <svelte:component
+                                            this={item.icon}
+                                            class="text-muted-foreground h-4 w-4 shrink-0" />
+                                    {/if}
+                                    <span
+                                        class="text-muted-foreground flex-1 truncate overflow-hidden text-sm"
+                                        >{item.label}</span>
+                                </div>
+                            </button>
+                        {/each}
+                    </div>
+                </div>
+            </Popover.Content>
+        </Popover.Root>
+    {/if}
+</div>

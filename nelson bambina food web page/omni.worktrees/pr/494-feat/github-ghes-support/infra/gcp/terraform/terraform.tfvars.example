@@ -1,0 +1,51 @@
+# Required
+project_id     = "my-gcp-project"
+customer_name  = "acme-corp"
+github_org     = "omni-platform"
+custom_domain  = "omni.acme-corp.com"
+
+# Optional - uncomment to override defaults
+# region                = "us-central1"
+# environment           = "production"
+# database_name         = "omni"
+# database_username     = "omni"
+# paradedb_machine_type = "e2-small"
+# paradedb_disk_size_gb = 50
+# redis_tier            = "BASIC"
+# redis_memory_size_gb  = 1
+# cloud_run_cpu         = "1"
+# cloud_run_memory      = "1Gi"
+# cloud_run_min_instances = 0
+# cloud_run_max_instances = 2
+# log_retention_days    = 30
+
+# Optional: AI Service Configuration (embedding provider is configured in the UI)
+# embedding_model         = "jina-embeddings-v3"
+# embedding_max_model_len = "8192"
+# ai_workers              = "1"
+
+# Optional: Searcher Configuration
+# semantic_search_timeout_ms = "1000"
+# rag_context_window         = "2"
+
+# Optional: Connector Manager Configuration
+# max_concurrent_syncs            = "10"
+# max_concurrent_syncs_per_type   = "3"
+# scheduler_poll_interval_seconds = "60"
+# stale_sync_timeout_minutes      = "10"
+
+# Optional: Google Connector Configuration
+# google_max_age_days                    = "730"
+# webhook_renewal_check_interval_seconds = "3600"
+
+# Optional: Slack Connector Configuration
+# slack_max_age_days                     = "730"
+
+# Optional: Common Service Configuration
+# rust_log                   = "info"
+# db_max_connections         = "10"
+# db_acquire_timeout_seconds = "3"
+# session_cookie_name        = "auth-session"
+# session_duration_days      = "7"
+# ai_answer_enabled          = "true"
+# agents_enabled             = "false"

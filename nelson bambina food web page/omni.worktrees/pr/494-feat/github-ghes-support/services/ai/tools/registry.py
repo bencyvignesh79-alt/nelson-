@@ -1,0 +1,110 @@
+"""ToolRegistry: central abstraction for tool collection and dispatch."""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
+
+from anthropic.types import ToolParam
+
+from db.models import UserConfiguration
+from tools.omni_tool_result import OAuthRequiredPayload
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ToolContext:
+    """Shared context passed to all tool handlers during execution."""
+
+    chat_id: str
+    user_id: str | None
+    user_email: str | None = None
+    user_groups: list[str] | None = None
+    user_configuration: UserConfiguration | None = None
+    original_user_query: str | None = None
+    skip_permission_check: bool = False
+
+@dataclass
+class ToolResult:
+    """Standardized result from tool execution."""
+
+    content: list  # ToolResultBlockParam content blocks
+    is_error: bool = False
+    # When set, the tool execution surfaced a structured "needs OAuth" prompt
+    # instead of a normal result. The router uses this to pause the agent loop
+    # and emit an oauth_required SSE frame; `content` carries the encoded
+    # envelope so the persisted message rehydrates the same UI on refresh.
+    oauth_required: OAuthRequiredPayload | None = None
+
+
+@runtime_checkable
+class ToolHandler(Protocol):
+    """Interface that all tool handlers implement."""
+
+    def get_tools(self) -> list[ToolParam]:
+        """Return LLM tool definitions this handler provides."""
+        ...
+
+    def can_handle(self, tool_name: str) -> bool:
+        """Whether this handler owns the given tool name."""
+        ...
+
+    async def execute(
+        self, tool_name: str, tool_input: dict, context: ToolContext
+    ) -> ToolResult:
+        """Execute the tool call and return the result."""
+        ...
+
+    def requires_approval(self, tool_name: str) -> bool:
+        """Whether this tool call needs user approval before execution."""
+        ...
+
+
+class ToolRegistry:
+    """Collects tools from all handlers and dispatches tool calls."""
+
+    def __init__(self) -> None:
+        self._handlers: list[ToolHandler] = []
+
+    def register(self, handler: ToolHandler) -> None:
+        self._handlers.append(handler)
+
+    def get_all_tools(self) -> list[ToolParam]:
+        """Collect tool definitions from all handlers for LLM injection."""
+        tools: list[ToolParam] = []
+        for handler in self._handlers:
+            tools.extend(handler.get_tools())
+        return tools
+
+    def requires_approval(self, tool_name: str) -> bool:
+        """Check if a tool call needs user approval."""
+        for handler in self._handlers:
+            if handler.can_handle(tool_name):
+                return handler.requires_approval(tool_name)
+        return True  # Unknown tools require approval by default
+
+    async def check_oauth_required(
+        self, tool_name: str, tool_input: dict, context: ToolContext
+    ) -> OAuthRequiredPayload | None:
+        """Check whether a tool needs OAuth before any approval/execution."""
+        for handler in self._handlers:
+            if handler.can_handle(tool_name):
+                checker = getattr(handler, "check_oauth_required", None)
+                if checker is None:
+                    return None
+                return await checker(tool_name, tool_input, context)
+        return None
+
+    async def execute(
+        self, tool_name: str, tool_input: dict, context: ToolContext
+    ) -> ToolResult:
+        """Dispatch tool call to the appropriate handler."""
+        for handler in self._handlers:
+            if handler.can_handle(tool_name):
+                return await handler.execute(tool_name, tool_input, context)
+        return ToolResult(
+            content=[{"type": "text", "text": f"Unknown tool: {tool_name}"}],
+            is_error=True,
+        )

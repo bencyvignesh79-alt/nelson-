@@ -1,0 +1,173 @@
+import { redirect, error } from '@sveltejs/kit'
+import type { RequestHandler } from './$types'
+import { getSourceById } from '$lib/server/db/sources'
+import { toolApprovalRepository } from '$lib/server/db/tool-approvals'
+import { SourceType } from '$lib/types'
+import {
+    generateAuthUrl,
+    generateAuthUrlForOrgSource,
+    generateAuthUrlForUserRead,
+    generateAuthUrlForUserWrite,
+    isProviderConfigured,
+    getOAuthConfigForSource,
+    getOAuthManifestForSourceType,
+    SOURCE_BINDING_CONFIG_KEY,
+} from '$lib/server/oauth/connectorOAuth'
+
+function oauthClientNotConfiguredMessage(provider: string): string {
+    return (
+        `OAuth client for ${provider} is not configured. Ask an admin to set it up under ` +
+        'Admin → Settings → Integrations → OAuth Apps.'
+    )
+}
+
+function isSalesforceNoSyncSource(source: { sourceType: string; config: unknown }): boolean {
+    return (
+        source.sourceType === SourceType.SALESFORCE &&
+        typeof source.config === 'object' &&
+        source.config !== null &&
+        !Array.isArray(source.config) &&
+        (source.config as Record<string, unknown>).sync_enabled === false
+    )
+}
+
+function hasSourceBinding(config: unknown): boolean {
+    if (typeof config !== 'object' || config === null || Array.isArray(config)) return false
+    const binding = (config as Record<string, unknown>)[SOURCE_BINDING_CONFIG_KEY]
+    return (
+        typeof binding === 'object' &&
+        binding !== null &&
+        !Array.isArray(binding) &&
+        Object.keys(binding).length > 0 &&
+        Object.entries(binding).every(
+            ([key, value]) => key.length > 0 && typeof value === 'string' && value.length > 0,
+        )
+    )
+}
+
+/// Unified OAuth start route. Flows are disambiguated by query params:
+///   ?source_types=google_drive,gmail          → connect_source flow
+///   ?source_id=01J...&flow=org_source         → admin org-source credential flow
+///   ?source_id=01J...&flow=user_read          → per-user read/action credential flow
+///   ?source_id=01J...&flow=user_write         → per-user read/write action credential flow
+/// Optional `return_to` is preserved through the callback for UI return links.
+export const GET: RequestHandler = async ({ url, locals }) => {
+    if (!locals.user) {
+        throw error(401, 'Unauthorized')
+    }
+
+    const sourceId = url.searchParams.get('source_id')
+    const flow = url.searchParams.get('flow') ?? 'user_write'
+    const sourceTypesParam = url.searchParams.get('source_types')
+    const returnTo = url.searchParams.get('return_to') ?? undefined
+    const approvalId = url.searchParams.get('approval_id') ?? undefined
+    const approvalChatId = url.searchParams.get('chat_id') ?? undefined
+    const requiredScopes = (url.searchParams.get('required_scopes') ?? '')
+        .split(',')
+        .map((scope) => scope.trim())
+        .filter(Boolean)
+
+    if (sourceId) {
+        if (flow !== 'org_source' && flow !== 'user_read' && flow !== 'user_write') {
+            throw error(400, 'flow must be org_source, user_read, or user_write')
+        }
+
+        const source = await getSourceById(sourceId)
+        if (!source || source.isDeleted) throw error(404, 'Source not found')
+        if (
+            isSalesforceNoSyncSource(source) &&
+            !hasSourceBinding(source.config) &&
+            locals.user.role !== 'admin'
+        ) {
+            throw error(403, 'An administrator must authorize and bind this Salesforce source first')
+        }
+        if (source.scope === 'user') {
+            if (flow === 'org_source') {
+                throw error(400, 'org_source OAuth is only valid for org-wide sources')
+            }
+            if (source.createdBy !== locals.user.id) {
+                throw error(403, "Cannot attach OAuth credentials to another user's source")
+            }
+        } else if (source.scope !== 'org') {
+            throw error(400, `Unsupported source scope: ${source.scope}`)
+        }
+
+        const config = await getOAuthConfigForSource(source)
+        if (!config) {
+            throw error(501, `OAuth is not implemented for source_type=${source.sourceType} yet.`)
+        }
+        if (flow === 'org_source' && config.supports_org_oauth === false) {
+            throw error(400, 'This connector does not support OAuth for org sources')
+        }
+        if (!(await isProviderConfigured(config.provider, config))) {
+            throw error(412, oauthClientNotConfiguredMessage(config.provider))
+        }
+
+        if (approvalId || approvalChatId) {
+            if (!approvalId || !approvalChatId) {
+                throw error(400, 'approval_id and chat_id must be provided together')
+            }
+            if (flow !== 'user_write') {
+                throw error(400, 'OAuth approval requires user_write flow')
+            }
+            const approval = await toolApprovalRepository.getPendingOAuthForUserAndSource(
+                approvalId,
+                locals.user.id,
+                approvalChatId,
+                sourceId,
+                source.sourceType,
+                config.provider,
+            )
+            if (!approval) throw error(400, 'Invalid OAuth approval')
+        }
+
+        if (flow === 'org_source') {
+            if (locals.user.role !== 'admin') {
+                throw error(403, 'Admin access required')
+            }
+            const { url: authUrl } = await generateAuthUrlForOrgSource({
+                sourceId,
+                sourceType: source.sourceType,
+                userId: locals.user.id,
+                source,
+                returnTo,
+            })
+            throw redirect(302, authUrl)
+        }
+
+        const generator =
+            flow === 'user_read' ? generateAuthUrlForUserRead : generateAuthUrlForUserWrite
+        const { url: authUrl } = await generator({
+            sourceId,
+            sourceType: source.sourceType,
+            source,
+            userId: locals.user.id,
+            returnTo,
+            approvalId,
+            approvalChatId,
+            requiredScopes,
+        })
+        throw redirect(302, authUrl)
+    }
+
+    if (sourceTypesParam) {
+        const sourceTypes = sourceTypesParam.split(',').filter(Boolean)
+        if (sourceTypes.length === 0) throw error(400, 'source_types must not be empty')
+
+        const config = await getOAuthManifestForSourceType(sourceTypes[0])
+        if (!config) {
+            throw error(501, `OAuth not implemented for source_type=${sourceTypes[0]}`)
+        }
+        if (!(await isProviderConfigured(config.provider, config))) {
+            throw error(412, oauthClientNotConfiguredMessage(config.provider))
+        }
+
+        const { url: authUrl } = await generateAuthUrl({
+            flow: { type: 'connect_source', sourceTypes, returnTo },
+            userId: locals.user.id,
+        })
+        throw redirect(302, authUrl)
+    }
+
+    throw error(400, 'Either source_id or source_types must be provided')
+}

@@ -1,0 +1,589 @@
+import { z } from 'zod';
+
+export const SyncMode = {
+  FULL: 'full',
+  INCREMENTAL: 'incremental',
+  REALTIME: 'realtime',
+} as const;
+export type SyncMode = (typeof SyncMode)[keyof typeof SyncMode];
+
+export const EventType = {
+  DOCUMENT_CREATED: 'document_created',
+  DOCUMENT_UPDATED: 'document_updated',
+  DOCUMENT_DELETED: 'document_deleted',
+  GROUP_MEMBERSHIP_SYNC: 'group_membership_sync',
+  PERSON_SYNC: 'person_sync',
+  PERSON_DELETED: 'person_deleted',
+} as const;
+export type EventType = (typeof EventType)[keyof typeof EventType];
+
+export const DocumentMetadataSchema = z.object({
+  title: z.string().optional(),
+  author: z.string().optional(),
+  created_at: z.string().datetime().optional(),
+  updated_at: z.string().datetime().optional(),
+  mime_type: z.string().optional(),
+  size: z.string().optional(),
+  content_type: z.string().optional(),
+  url: z.string().optional(),
+  path: z.string().optional(),
+  extra: z.record(z.unknown()).optional(),
+});
+export type DocumentMetadata = z.infer<typeof DocumentMetadataSchema>;
+
+export const DocumentPermissionsSchema = z.object({
+  public: z.boolean().default(false),
+  users: z.array(z.string()).default([]),
+  groups: z.array(z.string()).default([]),
+});
+export type DocumentPermissions = z.infer<typeof DocumentPermissionsSchema>;
+
+export const DocumentSchema = z.object({
+  external_id: z.string(),
+  title: z.string(),
+  content_id: z.string(),
+  metadata: DocumentMetadataSchema.optional(),
+  permissions: DocumentPermissionsSchema.optional(),
+  attributes: z.record(z.unknown()).optional(),
+});
+export type Document = z.infer<typeof DocumentSchema>;
+
+const DocumentEventIdentityFields = {
+  sync_run_id: z.string(),
+  source_id: z.string(),
+  document_id: z.string(),
+};
+const DocumentEventContentFields = {
+  content_id: z.string(),
+  metadata: DocumentMetadataSchema,
+  attributes: z.record(z.unknown()).optional(),
+};
+
+export const DocumentEventSchema = z.discriminatedUnion('type', [
+  z.object({
+    type: z.literal('document_created'),
+    ...DocumentEventIdentityFields,
+    ...DocumentEventContentFields,
+    permissions: DocumentPermissionsSchema,
+  }),
+  z.object({
+    type: z.literal('document_updated'),
+    ...DocumentEventIdentityFields,
+    ...DocumentEventContentFields,
+    permissions: DocumentPermissionsSchema.optional(),
+  }),
+  z.object({ type: z.literal('document_deleted'), ...DocumentEventIdentityFields }),
+]);
+export type DocumentEvent = z.infer<typeof DocumentEventSchema>;
+
+export const PersonSyncRecordSchema = z.object({
+  external_id: z.string(),
+  email: z.string(),
+  display_name: z.string().nullable().optional(),
+  given_name: z.string().nullable().optional(),
+  middle_name: z.string().nullable().optional(),
+  surname: z.string().nullable().optional(),
+  job_title: z.string().nullable().optional(),
+  department: z.string().nullable().optional(),
+  division: z.string().nullable().optional(),
+  company_name: z.string().nullable().optional(),
+  office_location: z.string().nullable().optional(),
+  work_country: z.string().nullable().optional(),
+  employee_id: z.string().nullable().optional(),
+  employee_type: z.string().nullable().optional(),
+  cost_center: z.string().nullable().optional(),
+  grade: z.string().nullable().optional(),
+  band: z.string().nullable().optional(),
+  confirmation_status: z.string().nullable().optional(),
+  employment_start_date: z.string().nullable().optional(),
+  employment_end_date: z.string().nullable().optional(),
+  manager_external_id: z.string().nullable().optional(),
+  source_updated_at: z.string().nullable().optional(),
+});
+export type PersonSyncRecord = z.infer<typeof PersonSyncRecordSchema>;
+
+export const PersonSyncEventSchema = z.object({
+  type: z.literal('person_sync'),
+  sync_run_id: z.string(),
+  source_id: z.string(),
+  person: PersonSyncRecordSchema,
+});
+export type PersonSyncEvent = z.infer<typeof PersonSyncEventSchema>;
+
+export const PersonDeletedEventSchema = z.object({
+  type: z.literal('person_deleted'),
+  sync_run_id: z.string(),
+  source_id: z.string(),
+  email: z.string(),
+});
+export type PersonDeletedEvent = z.infer<typeof PersonDeletedEventSchema>;
+
+export const GroupMembershipEventSchema = z.object({
+  type: z.literal('group_membership_sync'),
+  sync_run_id: z.string(),
+  source_id: z.string(),
+  group_email: z.string(),
+  group_name: z.string().optional(),
+  member_emails: z.array(z.string()).default([]),
+});
+export type GroupMembershipEvent = z.infer<typeof GroupMembershipEventSchema>;
+
+/**
+ * Discriminated union for all connector event types.
+ */
+export const ConnectorEventSchema = z.union([
+  DocumentEventSchema,
+  GroupMembershipEventSchema,
+  PersonSyncEventSchema,
+  PersonDeletedEventSchema,
+]);
+export type ConnectorEvent = z.infer<typeof ConnectorEventSchema>;
+
+export const ActionCredentialScopeSchema = z.enum(['user', 'org']);
+export type ActionCredentialScope = z.infer<typeof ActionCredentialScopeSchema>;
+
+export const ActionOriginSchema = z.enum(['native', 'mcp']);
+export type ActionOrigin = z.infer<typeof ActionOriginSchema>;
+
+export const ActionDefinitionSchema = z.object({
+  name: z.string(),
+  description: z.string(),
+  input_schema: z.record(z.any()).default({ type: 'object', properties: {} }),
+  mode: z.enum(['read', 'write']).default('write'),
+  credential_scope: ActionCredentialScopeSchema.default('user'),
+  required_scopes: z.array(z.string()).optional(),
+  source_types: z.array(z.string()).default([]),
+  admin_only: z.boolean().default(false),
+  hidden: z.boolean().default(false),
+  actor_scoped: z.boolean().default(false),
+  origin: ActionOriginSchema.default('native'),
+});
+export type ActionDefinition = z.infer<typeof ActionDefinitionSchema>;
+
+export const SearchOperatorSchema = z.object({
+  operator: z.string(),
+  attribute_key: z.string(),
+  value_type: z.string().default('text'),  // "person", "text", "datetime"
+});
+export type SearchOperator = z.infer<typeof SearchOperatorSchema>;
+
+export const McpResourceDefinitionSchema = z.object({
+  uri_template: z.string(),
+  name: z.string(),
+  description: z.string().optional(),
+  mime_type: z.string().optional(),
+});
+export type McpResourceDefinition = z.infer<typeof McpResourceDefinitionSchema>;
+
+export const McpPromptArgumentSchema = z.object({
+  name: z.string(),
+  description: z.string().optional(),
+  required: z.boolean().default(false),
+});
+export type McpPromptArgument = z.infer<typeof McpPromptArgumentSchema>;
+
+export const McpPromptDefinitionSchema = z.object({
+  name: z.string(),
+  description: z.string().optional(),
+  arguments: z.array(McpPromptArgumentSchema).default([]),
+});
+export type McpPromptDefinition = z.infer<typeof McpPromptDefinitionSchema>;
+
+export const OAuthScopeSetSchema = z.object({
+  read: z.array(z.string()).default([]),
+  write: z.array(z.string()).default([]),
+});
+export type OAuthScopeSet = z.infer<typeof OAuthScopeSetSchema>;
+
+export const OAuthTokenEndpointAuthMethodSchema = z.enum([
+  'client_secret_post',
+  'client_secret_basic',
+  'none',
+]);
+export type OAuthTokenEndpointAuthMethod = z.infer<
+  typeof OAuthTokenEndpointAuthMethodSchema
+>;
+
+export const OAuthManifestConfigSchema = z.object({
+  provider: z.string(),
+  auth_endpoint: z.string(),
+  token_endpoint: z.string(),
+  userinfo_endpoint: z.string().optional(),
+  userinfo_email_field: z.string().default('email'),
+  identity_scopes: z.array(z.string()).default([]),
+  scopes: z.record(OAuthScopeSetSchema).default({}),
+  extra_auth_params: z.record(z.string()).default({}),
+  scope_separator: z.string().default(' '),
+  enrich_endpoint: z.string().nullable().optional(),
+  /**
+   * OAuth Dynamic Client Registration endpoint. Set this for providers where
+   * Omni should auto-create an OAuth client instead of asking admins to
+   * configure one manually.
+   */
+  registration_endpoint: z.string().nullable().optional(),
+  registration_requires_initial_access_token: z.boolean().default(false),
+  /**
+   * OAuth token endpoint client authentication method. Public DCR clients
+   * usually use `none`, which tells Omni not to require or send a client
+   * secret and to treat the provider as auto-managed when
+   * `registration_endpoint` is also present.
+   */
+  token_response_fields: z.array(z.string()).default([]),
+  token_endpoint_auth_method: OAuthTokenEndpointAuthMethodSchema.default(
+    'client_secret_post'
+  ),
+  /**
+   * Optional OAuth resource indicator (RFC 8707) sent on auth/token requests
+   * for providers that bind tokens to a specific resource, such as a remote
+   * MCP server.
+   */
+  resource: z.string().nullable().optional(),
+  issuer_source_config_key: z.string().nullable().optional(),
+  client_config_provider_template: z.string().nullable().optional(),
+  pkce_required: z.boolean().default(false),
+  grant_types: z.array(z.string()).nullable().optional(),
+  validate_endpoint_urls: z.boolean().default(false),
+  supports_org_oauth: z.boolean().default(true),
+});
+export type OAuthManifestConfig = z.infer<typeof OAuthManifestConfigSchema>;
+
+export const ConnectorSkillDefinitionSchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  description: z.string().optional(),
+  source_types: z.array(z.string()).default([]),
+  content: z.string().nullable().optional(),
+  mcp_prompt: z.string().nullable().optional(),
+});
+export type ConnectorSkillDefinition = z.infer<
+  typeof ConnectorSkillDefinitionSchema
+>;
+
+export const ConnectorSourceCapabilitiesSchema = z.object({
+  source_id: z.string(),
+  actions: z.array(ActionDefinitionSchema).default([]),
+  resources: z.array(McpResourceDefinitionSchema).default([]),
+  prompts: z.array(McpPromptDefinitionSchema).default([]),
+  skills: z.array(ConnectorSkillDefinitionSchema).default([]),
+});
+export type ConnectorSourceCapabilities = z.infer<
+  typeof ConnectorSourceCapabilitiesSchema
+>;
+
+export const ConnectorManifestSchema = z.object({
+  name: z.string(),
+  display_name: z.string(),
+  version: z.string(),
+  sync_modes: z.array(z.string()),
+  connector_id: z.string(),
+  connector_url: z.string(),
+  integration_type: z.enum(['connector', 'remote_mcp']).default('connector'),
+  source_types: z.array(z.string()).default([]),
+  description: z.string().optional(),
+  // Deprecated compatibility catalog. New and migrated connectors should
+  // publish actions in source_capabilities; source-specific definitions win
+  // over a legacy definition with the same name for that source.
+  actions: z.array(ActionDefinitionSchema).default([]),
+  search_operators: z.array(SearchOperatorSchema).default([]),
+  extra_schema: z.record(z.unknown()).optional(),
+  attributes_schema: z.record(z.unknown()).optional(),
+  read_only: z.boolean().default(false),
+  mcp_enabled: z.boolean().default(false),
+  mcp_catalog_loaded: z.boolean().default(false),
+  resources: z.array(McpResourceDefinitionSchema).default([]),
+  prompts: z.array(McpPromptDefinitionSchema).default([]),
+  skills: z.array(ConnectorSkillDefinitionSchema).default([]),
+  source_capabilities: z.array(ConnectorSourceCapabilitiesSchema).default([]),
+  oauth: OAuthManifestConfigSchema.nullable().optional(),
+});
+export type ConnectorManifest = z.infer<typeof ConnectorManifestSchema>;
+
+export const SyncRequestSchema = z.object({
+  sync_run_id: z.string(),
+  source_id: z.string(),
+  sync_mode: z.string(),
+  checkpoint: z.record(z.unknown()).nullable().default(null),
+  is_resume: z.boolean().default(false),
+  // Manager's running tally at dispatch time. Zero on a fresh sync;
+  // non-zero on resume so the connector can keep counting from there.
+  documents_scanned: z.number().int().default(0),
+  documents_updated: z.number().int().default(0),
+});
+export type SyncRequest = z.infer<typeof SyncRequestSchema>;
+
+export const SyncResponseSchema = z.object({
+  status: z.string(),
+  message: z.string().optional(),
+});
+export type SyncResponse = z.infer<typeof SyncResponseSchema>;
+
+export function createSyncResponseStarted(): SyncResponse {
+  return { status: 'started' };
+}
+
+export function createSyncResponseError(message: string): SyncResponse {
+  return { status: 'error', message };
+}
+
+export const CancelRequestSchema = z.object({
+  sync_run_id: z.string(),
+});
+export type CancelRequest = z.infer<typeof CancelRequestSchema>;
+
+export const CancelResponseSchema = z.object({
+  status: z.string(),
+});
+export type CancelResponse = z.infer<typeof CancelResponseSchema>;
+
+export const SourceSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  source_type: z.string(),
+  config: z.record(z.unknown()),
+  is_active: z.boolean().optional(),
+});
+export type Source = z.infer<typeof SourceSchema>;
+
+export const ActionRequestSchema = z.object({
+  action: z.string(),
+  params: z.record(z.unknown()),
+  credentials: z.record(z.unknown()).optional(),
+  source: SourceSchema.optional(),
+  actor_email: z.string().optional(),
+});
+export type ActionRequest = z.infer<typeof ActionRequestSchema>;
+
+export const OAuthCredentialReadyRequestSchema = z.object({
+  source_id: z.string(),
+  user_id: z.string().nullable().optional(),
+  provider: z.string(),
+  flow: z.string(),
+  credentials: z.record(z.unknown()).default({}),
+});
+export type OAuthCredentialReadyRequest = z.infer<
+  typeof OAuthCredentialReadyRequestSchema
+>;
+
+export const OAuthCredentialFlowSchema = z.enum([
+  'org_source',
+  'connect_source',
+  'user_read',
+  'user_write',
+]);
+export type OAuthCredentialFlow = z.infer<typeof OAuthCredentialFlowSchema>;
+
+export const OAuthSourceBindingSchema = z.record(z.string());
+export type OAuthSourceBinding = z.infer<typeof OAuthSourceBindingSchema>;
+
+export const OAuthCredentialValidationRequestSchema = z.object({
+  source_id: z.string(),
+  provider: z.string(),
+  credentials: z.record(z.unknown()).default({}),
+  flow: OAuthCredentialFlowSchema,
+  metadata: z.record(z.unknown()).default({}),
+  source: SourceSchema.nullable().optional(),
+});
+export type OAuthCredentialValidationRequest = z.infer<
+  typeof OAuthCredentialValidationRequestSchema
+>;
+
+export const OAuthCredentialValidationResponseSchema = z.object({
+  source_binding: OAuthSourceBindingSchema.nullable().optional(),
+});
+export type OAuthCredentialValidationResponse = z.infer<
+  typeof OAuthCredentialValidationResponseSchema
+>;
+
+export const ActionResponseSchema = z.object({
+  status: z.string(),
+  result: z.record(z.unknown()).optional(),
+  error: z.string().optional(),
+});
+export class ActionResponse {
+  status: string;
+  result?: Record<string, unknown>;
+  error?: string;
+
+  constructor(options: {
+    status: string;
+    result?: Record<string, unknown>;
+    error?: string;
+  }) {
+    this.status = options.status;
+    this.result = options.result;
+    this.error = options.error;
+  }
+
+  /** Convert this ActionResponse into a web-standard HTTP Response. */
+  toResponse(statusCode?: number): Response {
+    const status = statusCode ?? (this.status === 'success' ? 200 : 400);
+    return new Response(JSON.stringify(this), {
+      status,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  static success(result: Record<string, unknown>): ActionResponse {
+    return new ActionResponse({ status: 'success', result });
+  }
+
+  static failure(error: string): ActionResponse {
+    return new ActionResponse({ status: 'error', error });
+  }
+
+  static notSupported(action: string): ActionResponse {
+    return new ActionResponse({ status: 'error', error: `Action not supported: ${action}` });
+  }
+}
+
+export const ResourceRequestSchema = z.object({
+  uri: z.string(),
+  credentials: z.record(z.unknown()).default({}),
+  source: SourceSchema.nullable().optional(),
+});
+export type ResourceRequest = z.infer<typeof ResourceRequestSchema>;
+
+export const PromptRequestSchema = z.object({
+  name: z.string(),
+  arguments: z.record(z.unknown()).optional(),
+  credentials: z.record(z.unknown()).default({}),
+  source: SourceSchema.nullable().optional(),
+});
+export type PromptRequest = z.infer<typeof PromptRequestSchema>;
+
+interface DocumentEventIdentityPayload {
+  sync_run_id: string;
+  source_id: string;
+  document_id: string;
+}
+
+export interface DocumentCreatedEventPayload extends DocumentEventIdentityPayload {
+  type: typeof EventType.DOCUMENT_CREATED;
+  content_id: string;
+  metadata: DocumentMetadata;
+  permissions: DocumentPermissions;
+  attributes?: Record<string, unknown>;
+}
+
+export interface DocumentUpdatedEventPayload extends DocumentEventIdentityPayload {
+  type: typeof EventType.DOCUMENT_UPDATED;
+  content_id: string;
+  metadata: DocumentMetadata;
+  permissions?: DocumentPermissions;
+  attributes?: Record<string, unknown>;
+}
+
+export interface DocumentDeletedEventPayload extends DocumentEventIdentityPayload {
+  type: typeof EventType.DOCUMENT_DELETED;
+}
+
+export interface GroupMembershipEventPayload {
+  type: typeof EventType.GROUP_MEMBERSHIP_SYNC;
+  sync_run_id: string;
+  source_id: string;
+  group_email: string;
+  group_name?: string;
+  member_emails: string[];
+}
+
+export interface PersonSyncEventPayload {
+  type: typeof EventType.PERSON_SYNC;
+  sync_run_id: string;
+  source_id: string;
+  person: PersonSyncRecord;
+}
+
+export interface PersonDeletedEventPayload {
+  type: typeof EventType.PERSON_DELETED;
+  sync_run_id: string;
+  source_id: string;
+  email: string;
+}
+
+export type ConnectorEventPayload =
+  | DocumentCreatedEventPayload
+  | DocumentUpdatedEventPayload
+  | DocumentDeletedEventPayload
+  | GroupMembershipEventPayload
+  | PersonSyncEventPayload
+  | PersonDeletedEventPayload;
+
+export function serializeConnectorEvent(event: ConnectorEventPayload): Record<string, unknown> {
+  if (event.type === EventType.GROUP_MEMBERSHIP_SYNC) {
+    return {
+      type: event.type,
+      sync_run_id: event.sync_run_id,
+      source_id: event.source_id,
+      group_email: event.group_email,
+      group_name: event.group_name,
+      member_emails: event.member_emails,
+    };
+  }
+
+  if (event.type === EventType.PERSON_SYNC) {
+    return {
+      type: event.type,
+      sync_run_id: event.sync_run_id,
+      source_id: event.source_id,
+      person: event.person,
+    };
+  }
+
+  if (event.type === EventType.PERSON_DELETED) {
+    return {
+      type: event.type,
+      sync_run_id: event.sync_run_id,
+      source_id: event.source_id,
+      email: event.email,
+    };
+  }
+
+  const base: Record<string, unknown> = {
+    type: event.type,
+    sync_run_id: event.sync_run_id,
+    source_id: event.source_id,
+    document_id: event.document_id,
+  };
+
+  if (event.type === EventType.DOCUMENT_DELETED) {
+    return base;
+  }
+
+  base.content_id = event.content_id;
+  base.metadata = event.metadata ?? {};
+  base.permissions = event.permissions ?? { public: false, users: [], groups: [] };
+  if (event.attributes) {
+    base.attributes = event.attributes;
+  }
+
+  return base;
+}
+
+export const UserFilterMode = {
+  ALL: 'all',
+  WHITELIST: 'whitelist',
+  BLACKLIST: 'blacklist',
+} as const;
+export type UserFilterMode = (typeof UserFilterMode)[keyof typeof UserFilterMode];
+
+/**
+ * Wire shape of GET /sdk/source/:source_id/sync-config from connector-manager.
+ *
+ * Defaults match the manager's own defaults: `user_filter_mode = 'all'` admits
+ * every user; `user_whitelist` / `user_blacklist` are nullable since the
+ * server stores them as `Option<JsonValue>`. `source_type` is nullable to
+ * tolerate older payload shapes — connector-manager always sets it today.
+ */
+export const SdkSourceSyncDataSchema = z.object({
+  config: z.record(z.unknown()).default({}),
+  credentials: z.record(z.unknown()).default({}),
+  connector_state: z.record(z.unknown()).nullable().default(null),
+  checkpoint: z.record(z.unknown()).nullable().default(null),
+  source_type: z.string().nullable().default(null),
+  user_filter_mode: z
+    .enum([UserFilterMode.ALL, UserFilterMode.WHITELIST, UserFilterMode.BLACKLIST])
+    .default(UserFilterMode.ALL),
+  user_whitelist: z.array(z.string()).nullable().default(null),
+  user_blacklist: z.array(z.string()).nullable().default(null),
+});
+export type SdkSourceSyncData = z.infer<typeof SdkSourceSyncDataSchema>;

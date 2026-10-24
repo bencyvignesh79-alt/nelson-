@@ -1,0 +1,22 @@
+{
+  "inputs": [
+    {
+      "type": "promptString",
+      "id": "gemini-api-key",
+      "description": "Gemini API key for the local VBS/BFT MCP server",
+      "password": true
+    }
+  ],
+  "servers": {
+    "vbs-bft-gemini": {
+      "type": "stdio",
+      "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "bft_ai.mcp_server"],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "GEMINI_API_KEY": "${input:gemini-api-key}",
+        "GEMINI_MODEL": "gemini-2.5-flash"
+      }
+    }
+  }
+}

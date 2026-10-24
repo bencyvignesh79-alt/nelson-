@@ -1,0 +1,503 @@
+use crate::db::pool::DatabasePool;
+use crate::db::repositories::DocumentRepository;
+use crate::models::Document;
+use anyhow::Result;
+use redis::Client as RedisClient;
+use serde_json::json;
+use sqlx::PgPool;
+use std::env;
+use tokio::time::{Duration, sleep, timeout};
+use ulid::Ulid;
+use uuid::Uuid;
+
+/// Base test fixture for database and Redis setup
+pub struct BaseTestFixture {
+    pub db_pool: DatabasePool,
+    pub redis_client: RedisClient,
+    db_name: String,
+}
+
+impl BaseTestFixture {
+    /// Create a new test fixture with isolated database and Redis
+    pub async fn new() -> Result<Self> {
+        tracing_subscriber::fmt::try_init().ok();
+        let (db_pool, db_name) = setup_test_database_internal().await?;
+        let redis_client = setup_test_redis().await?;
+
+        Ok(Self {
+            db_pool,
+            redis_client,
+            db_name,
+        })
+    }
+
+    /// Get the database pool
+    pub fn db_pool(&self) -> &DatabasePool {
+        &self.db_pool
+    }
+
+    /// Get the Redis client
+    pub fn redis_client(&self) -> &RedisClient {
+        &self.redis_client
+    }
+
+    /// Get database config for tests
+    pub fn database_config(&self) -> crate::config::DatabaseConfig {
+        crate::config::DatabaseConfig {
+            database_url: format!(
+                "postgresql://clio:omni_password@localhost:5432/{}",
+                &self.db_name
+            ),
+            max_connections: 5,
+            acquire_timeout_seconds: 30,
+            require_ssl: false,
+        }
+    }
+
+    /// Get Redis config for tests  
+    pub fn redis_config(&self) -> crate::config::RedisConfig {
+        crate::config::RedisConfig {
+            redis_url: env::var("REDIS_URL")
+                .unwrap_or_else(|_| "redis://localhost:6379/1".to_string()),
+        }
+    }
+
+    /// Manually cleanup the test database (automatically called on drop)
+    pub async fn cleanup(&self) -> Result<()> {
+        let base_url = env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://clio:omni_password@localhost:5432/clio".to_string());
+        cleanup_test_database_by_name(&base_url, &self.db_name).await
+    }
+}
+
+impl Drop for BaseTestFixture {
+    fn drop(&mut self) {
+        let db_name = self.db_name.clone();
+        let base_url = env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://clio:omni_password@localhost:5432/clio".to_string());
+
+        // Best effort cleanup - if we're in a panic, skip cleanup
+        if std::thread::panicking() {
+            eprintln!(
+                "Warning: Test panicked, database {} may not be cleaned up",
+                db_name
+            );
+            return;
+        }
+
+        // Try to spawn cleanup task if we have a tokio runtime available
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                let cleanup_db_name = db_name.clone();
+                let cleanup_base_url = base_url.clone();
+                // Spawn and detach the cleanup task - it will run in the background
+                let _ = handle.spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await; // Give test time to finish
+                    if let Err(e) =
+                        cleanup_test_database_by_name(&cleanup_base_url, &cleanup_db_name).await
+                    {
+                        eprintln!(
+                            "Warning: Failed to cleanup test database {}: {:?}",
+                            cleanup_db_name, e
+                        );
+                    }
+                });
+            }
+            _ => {
+                eprintln!(
+                    "Warning: No tokio runtime available, database {} may not be cleaned up",
+                    db_name
+                );
+            }
+        }
+    }
+}
+
+/// Internal function that returns both pool and database name
+async fn setup_test_database_internal() -> Result<(DatabasePool, String)> {
+    dotenvy::dotenv().ok();
+
+    let base_url = env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgresql://clio:omni_password@localhost:5432/clio".to_string());
+
+    let test_db_name = format!("omni_test_{}", Uuid::new_v4().to_string().replace("-", ""));
+
+    let (base_url_without_db, _) = base_url.rsplit_once('/').unwrap();
+    let admin_url = format!("{}/postgres", base_url_without_db);
+
+    let admin_pool = PgPool::connect(&admin_url).await?;
+    sqlx::query(&format!("CREATE DATABASE {}", test_db_name))
+        .execute(&admin_pool)
+        .await?;
+
+    let test_db_url = format!("{}/{}", base_url_without_db, test_db_name);
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { env::set_var("DATABASE_URL", &test_db_url) };
+
+    let db_pool = DatabasePool::new(&test_db_url).await?;
+
+    // Run migrations - look for migrations in the services that include this
+    if let Ok(migrations_dir) = env::var("TEST_MIGRATIONS_DIR") {
+        sqlx::migrate::Migrator::new(std::path::Path::new(&migrations_dir))
+            .await?
+            .run(db_pool.pool())
+            .await?;
+    }
+
+    seed_test_data(db_pool.pool()).await?;
+
+    Ok((db_pool, test_db_name))
+}
+
+pub async fn setup_test_redis() -> Result<RedisClient> {
+    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+
+    let client = RedisClient::open(redis_url)?;
+
+    let mut conn = client.get_multiplexed_async_connection().await?;
+    redis::cmd("FLUSHDB")
+        .query_async::<String>(&mut conn)
+        .await?;
+
+    Ok(client)
+}
+
+async fn seed_test_data(pool: &PgPool) -> Result<()> {
+    eprintln!("Seeding test data");
+    let user_id = "01JGF7V3E0Y2R1X8P5Q7W9T4N6";
+    let source_id = "01JGF7V3E0Y2R1X8P5Q7W9T4N7";
+
+    sqlx::query(
+        r#"
+        INSERT INTO users (id, email, password_hash, created_at, updated_at)
+        VALUES ($1, 'test@example.com', 'hash', NOW(), NOW())
+        ON CONFLICT (id) DO NOTHING
+        "#,
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO sources (id, name, source_type, config, created_by, created_at, updated_at)
+        VALUES ($1, 'Test Source', 'local_files', '{}', $2, NOW(), NOW())
+        ON CONFLICT (id) DO NOTHING
+        "#,
+    )
+    .bind(source_id)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Cleanup test database by name - used by Drop impl
+async fn cleanup_test_database_by_name(base_url: &str, db_name: &str) -> Result<()> {
+    // Only cleanup test databases
+    if !db_name.starts_with("omni_test_") {
+        return Ok(());
+    }
+
+    let (base_url_without_db, _) = base_url.rsplit_once('/').unwrap();
+    let admin_url = format!("{}/postgres", base_url_without_db);
+    let admin_pool = PgPool::connect(&admin_url).await?;
+
+    sqlx::query(&format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", db_name))
+        .execute(&admin_pool)
+        .await?;
+
+    Ok(())
+}
+
+/// Wait for a document to exist in the database with polling and timeout
+pub async fn wait_for_document_exists(
+    repo: &DocumentRepository,
+    source_id: &str,
+    doc_id: &str,
+    timeout_duration: Duration,
+) -> Result<Document, String> {
+    let result = timeout(timeout_duration, async {
+        loop {
+            if let Ok(Some(doc)) = repo.find_by_external_id(source_id, doc_id).await {
+                return doc;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+
+    match result {
+        Ok(doc) => Ok(doc),
+        Err(_) => Err(format!(
+            "Document {}:{} not found within timeout",
+            source_id, doc_id
+        )),
+    }
+}
+
+/// Wait for a document to be deleted from the database with polling and timeout
+pub async fn wait_for_document_deleted(
+    repo: &DocumentRepository,
+    source_id: &str,
+    doc_id: &str,
+    timeout_duration: Duration,
+) -> Result<(), String> {
+    let result = timeout(timeout_duration, async {
+        loop {
+            if let Ok(None) = repo.find_by_external_id(source_id, doc_id).await {
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+
+    match result {
+        Ok(_) => Ok(()),
+        Err(_) => Err(format!(
+            "Document {}:{} was not deleted within timeout",
+            source_id, doc_id
+        )),
+    }
+}
+
+/// Returns the content strings for the 9 test documents, in insertion order.
+/// Keep in sync with `create_test_documents`.
+struct TestDoc {
+    external_id: &'static str,
+    title: &'static str,
+    content: &'static str,
+    content_type: &'static str,
+    attributes: serde_json::Value,
+    metadata: serde_json::Value,
+    permissions: serde_json::Value,
+}
+
+fn test_documents() -> Vec<TestDoc> {
+    vec![
+        TestDoc {
+            external_id: "tech_doc_1",
+            title: "Rust Programming Guide",
+            content: "This is a comprehensive guide to Rust programming language. It covers memory safety, ownership, borrowing, and lifetimes. Rust is a systems programming language that runs blazingly fast, prevents segfaults, and guarantees thread safety.",
+            content_type: "documentation",
+            attributes: json!({"language": "rust", "category": "programming"}),
+            metadata: json!({"type": "documentation", "category": "programming", "updated_at": "2026-03-05T10:00:00Z"}),
+            permissions: json!({"users": ["user1"], "groups": ["engineers"]}),
+        },
+        TestDoc {
+            external_id: "meeting_notes_1",
+            title: "Q4 Planning Meeting",
+            content: "Attendees discussed the roadmap for Q4. Key priorities include improving search functionality, implementing semantic search, and optimizing database queries. The team will focus on PostgreSQL performance and Redis caching.",
+            content_type: "meeting_notes",
+            attributes: json!({"category": "business", "quarter": "Q4"}),
+            metadata: json!({"type": "meeting", "date": "2024-01-15", "updated_at": "2026-03-04T09:00:00Z"}),
+            permissions: json!({"users": ["user1", "user2"], "groups": ["team"]}),
+        },
+        TestDoc {
+            external_id: "project_spec_1",
+            title: "Search Engine Architecture",
+            content: "The search engine combines full-text search with vector embeddings. It uses PostgreSQL with pgvector extension for similarity search. The architecture includes caching layer with Redis and supports multiple search modes: fulltext, semantic, and hybrid.",
+            content_type: "specification",
+            attributes: json!({"category": "programming", "component": "search"}),
+            metadata: json!({"type": "specification", "project": "clio", "updated_at": "2026-03-06T15:30:00Z"}),
+            permissions: json!({"users": ["user1"], "groups": ["architects"]}),
+        },
+        TestDoc {
+            external_id: "api_doc_1",
+            title: "REST API Endpoints",
+            content: "The API provides endpoints for document management and search. POST /search accepts queries with different modes. GET /suggestions returns autocomplete suggestions. All endpoints require authentication via JWT tokens.",
+            content_type: "api_documentation",
+            attributes: json!({"category": "programming", "component": "api"}),
+            metadata: json!({"type": "api_documentation", "version": "1.0"}),
+            permissions: json!({"users": ["user1", "user2"], "groups": ["developers"]}),
+        },
+        TestDoc {
+            external_id: "user_guide_1",
+            title: "Getting Started Guide",
+            content: "Welcome to Clio! This guide will help you get started with searching across your organization's documents. You can search using keywords, phrases, or ask questions in natural language. The system will find relevant documents and highlight important passages.",
+            content_type: "user_guide",
+            attributes: json!({"category": "onboarding"}),
+            metadata: json!({"type": "user_guide", "audience": "end_users"}),
+            permissions: json!({"users": ["user1", "user2", "user3"], "groups": ["all_users"]}),
+        },
+        TestDoc {
+            external_id: "ref_doc_1",
+            title: "Square Root Mathematics",
+            content: "The square root of a number is a value that, when multiplied by itself, gives the original number. Square roots are fundamental in mathematics and appear in many formulas.",
+            content_type: "reference",
+            attributes: json!({"category": "reference"}),
+            metadata: json!({"type": "reference"}),
+            permissions: json!({"users": ["user1"], "groups": ["all_users"]}),
+        },
+        TestDoc {
+            external_id: "legal_doc_1",
+            title: "BlueSquare NDA",
+            content: "Non-disclosure agreement between BlueSquare Inc and the organization. This NDA covers confidential information shared during the blue square partnership negotiations.",
+            content_type: "legal",
+            attributes: json!({"category": "legal"}),
+            metadata: json!({"type": "legal"}),
+            permissions: json!({"users": ["user1"], "groups": ["all_users"]}),
+        },
+        TestDoc {
+            external_id: "report_doc_1",
+            title: "CRM Sales Reports",
+            content: "Monthly CRM sales reports covering pipeline metrics, conversion rates, and revenue forecasts. The CRM sales report includes data from all regional teams and quarterly comparisons.",
+            content_type: "report",
+            attributes: json!({"category": "business"}),
+            metadata: json!({"type": "report"}),
+            permissions: json!({"users": ["user1"], "groups": ["all_users"]}),
+        },
+        TestDoc {
+            external_id: "report_doc_2",
+            title: "Urban Crime Reports",
+            content: "Analysis of urban crime reports across major metropolitan areas. This report examines trends in crime reporting, law enforcement response times, and community safety initiatives.",
+            content_type: "report",
+            attributes: json!({"category": "research"}),
+            metadata: json!({"type": "report"}),
+            permissions: json!({"users": ["user1"], "groups": ["all_users"]}),
+        },
+        TestDoc {
+            external_id: "maint_doc_1",
+            title: "Rust Prevention and Corrosion Control",
+            content: "Guide to preventing rust and corrosion on industrial equipment. Regular maintenance programming schedules help avoid costly repairs. Apply protective coatings to all exposed metal surfaces and inspect safety equipment monthly.",
+            content_type: "documentation",
+            attributes: json!({"category": "maintenance"}),
+            metadata: json!({"type": "documentation"}),
+            permissions: json!({"users": ["user1"], "groups": ["all_users"]}),
+        },
+        TestDoc {
+            external_id: "policy_doc_1",
+            title: "API Gateway Rate Limiting Policy",
+            content: "Internal API gateway rate limiting policy. All REST endpoints must respect global rate limits. The search functionality is exposed via the gateway but the primary endpoints serve the mobile application.",
+            content_type: "policy",
+            attributes: json!({"category": "infrastructure"}),
+            metadata: json!({"type": "policy"}),
+            permissions: json!({"users": ["user1"], "groups": ["all_users"]}),
+        },
+        TestDoc {
+            external_id: "career_doc_1",
+            title: "Job Search Tips for Engineers",
+            content: "Tips for conducting an effective job search in the tech industry. Build a strong architecture for your career by networking and maintaining an updated portfolio. Search engines like LinkedIn and Indeed can help.",
+            content_type: "article",
+            attributes: json!({"category": "career"}),
+            metadata: json!({"type": "article"}),
+            permissions: json!({"users": ["user1"], "groups": ["all_users"]}),
+        },
+        TestDoc {
+            external_id: "meeting_notes_2",
+            title: "Q4 Budget Review",
+            content: "Q4 budget review meeting with the finance team. Revenue targets were met but Q4 expenses exceeded projections by 12 percent. Planning for next fiscal year begins in January.",
+            content_type: "meeting_notes",
+            attributes: json!({"category": "business", "quarter": "Q4"}),
+            metadata: json!({"type": "meeting"}),
+            permissions: json!({"users": ["user1", "user2"], "groups": ["finance"]}),
+        },
+        TestDoc {
+            external_id: "safety_doc_1",
+            title: "Workplace Safety Guidelines",
+            content: "Workplace safety guidelines for the warehouse facility. All employees must complete mandatory safety training annually. Emergency procedures are posted near every exit. Report any safety hazards to management immediately.",
+            content_type: "policy",
+            attributes: json!({"category": "hr"}),
+            metadata: json!({"type": "policy"}),
+            permissions: json!({"users": ["user1"], "groups": ["all_users"]}),
+        },
+        TestDoc {
+            external_id: "edu_doc_1",
+            title: "Geometry of Quadrilaterals",
+            content: "Geometry lesson on quadrilaterals. A square has four equal sides and four right angles. Rectangles, rhombuses, and parallelograms are related shapes. The area of a square is calculated by squaring the side length.",
+            content_type: "reference",
+            attributes: json!({"category": "reference"}),
+            metadata: json!({"type": "reference"}),
+            permissions: json!({"users": ["user1"], "groups": ["all_users"]}),
+        },
+        TestDoc {
+            external_id: "report_doc_3",
+            title: "Death of a Salesman Book Report",
+            content: "Book report on Death of a Salesman by Arthur Miller. The play explores themes of the American Dream and personal sales of identity. Willy Loman's tragic story highlights the gap between ambition and reality.",
+            content_type: "report",
+            attributes: json!({"category": "literature"}),
+            metadata: json!({"type": "report"}),
+            permissions: json!({"users": ["user1"], "groups": ["all_users"]}),
+        },
+        TestDoc {
+            external_id: "travel_doc_1",
+            title: "Tokyo Travel Guide",
+            content: "Travel guide to Tokyo for first-time visitors. Must-see attractions include Shibuya Crossing, Senso-ji Temple, and the Meiji Shrine. The city offers an incredible mix of traditional culture and modern technology.",
+            content_type: "article",
+            attributes: json!({"category": "travel"}),
+            metadata: json!({"type": "article"}),
+            permissions: json!({"users": ["user1"], "groups": ["all_users"]}),
+        },
+    ]
+}
+
+/// Create test documents with various content for search testing
+pub async fn create_test_documents(pool: &PgPool) -> Result<Vec<String>> {
+    let source_id = "01JGF7V3E0Y2R1X8P5Q7W9T4N7";
+    let mut doc_ids = Vec::new();
+    let content_storage = crate::ContentStorage::new(pool.clone());
+
+    for doc in test_documents() {
+        let doc_id = Ulid::new().to_string();
+        let content_id = content_storage.store_text(doc.content.to_string()).await?;
+        sqlx::query(
+            r#"
+            INSERT INTO documents (id, source_id, external_id, title, content_id, content_type, attributes, content, metadata, permissions, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
+            "#,
+        )
+        .bind(&doc_id)
+        .bind(source_id)
+        .bind(doc.external_id)
+        .bind(doc.title)
+        .bind(&content_id)
+        .bind(doc.content_type)
+        .bind(&doc.attributes)
+        .bind(doc.content)
+        .bind(&doc.metadata)
+        .bind(&doc.permissions)
+        .execute(pool)
+        .await?;
+        doc_ids.push(doc_id);
+    }
+
+    Ok(doc_ids)
+}
+
+/// Create test documents with embeddings for semantic search testing.
+/// Uses the same word-hash embedding algorithm as the mock AI server so that
+/// query embeddings are meaningfully similar to document embeddings.
+pub async fn create_test_documents_with_embeddings(pool: &PgPool) -> Result<Vec<String>> {
+    let doc_ids = create_test_documents(pool).await?;
+
+    let docs = test_documents();
+
+    for (i, doc_id) in doc_ids.iter().enumerate() {
+        let embedding = crate::test_environment::generate_test_embedding(docs[i].content);
+        let embedding_id = Ulid::new().to_string();
+
+        sqlx::query(
+            r#"
+            INSERT INTO embeddings (id, document_id, chunk_index, chunk_start_offset, chunk_end_offset, embedding, model_name, dimensions, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+            "#,
+        )
+        .bind(embedding_id)
+        .bind(doc_id)
+        .bind(0) // chunk_index
+        .bind(0) // chunk_start_offset
+        .bind(docs[i].content.chars().count() as i32) // chunk_end_offset
+        .bind(&embedding)
+        .bind("test-model") // model_name — matches mock AI server
+        .bind(1024_i16) // dimensions
+        .execute(pool)
+        .await?;
+    }
+
+    Ok(doc_ids)
+}
+
+pub const TEST_USER_ID: &str = "01JGF7V3E0Y2R1X8P5Q7W9T4N6";
+pub const TEST_SOURCE_ID: &str = "01JGF7V3E0Y2R1X8P5Q7W9T4N7";

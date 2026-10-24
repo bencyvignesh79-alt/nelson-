@@ -1,0 +1,751 @@
+use crate::config::ConnectorManagerConfig;
+use crate::connector_client::{ClientError, ConnectorClient};
+use crate::handlers::get_connector_url_for_source;
+use crate::models::{SyncRequest, TriggerType};
+use dashmap::DashMap;
+use redis::Client as RedisClient;
+use shared::db::error::DatabaseError;
+use shared::db::repositories::SyncRunRepository;
+use shared::models::{IntegrationType, SyncSlotClass, SyncStatus, SyncType};
+use shared::{DatabasePool, Repository, SourceRepository};
+use sqlx::PgPool;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
+use tokio::time::timeout;
+use tracing::{debug, error, info, warn};
+
+const MAX_RESUME_ATTEMPTS: usize = 3;
+const MISSING_MANIFEST_GRACE_OBSERVATIONS: usize = 2;
+const CONNECTOR_TRIGGER_TIMEOUT: Duration = Duration::from_secs(150);
+
+#[derive(Clone)]
+pub struct SyncManager {
+    pool: PgPool,
+    config: ConnectorManagerConfig,
+    redis_client: RedisClient,
+    connector_client: ConnectorClient,
+    sync_run_repo: SyncRunRepository,
+    /// In-memory tally of resume attempts per sync_run_id. Cleared when a
+    /// sync transitions out of `running`. Bounds resume churn for chronically
+    /// crashing connectors without needing schema changes.
+    resume_attempts: Arc<DashMap<String, usize>>,
+    /// Consecutive monitor observations where the source type has no Redis
+    /// connector manifest. A short grace window prevents a transient heartbeat
+    /// miss from immediately being counted as a lost sync.
+    missing_manifest_observations: Arc<DashMap<String, usize>>,
+}
+
+impl SyncManager {
+    pub fn new(
+        db_pool: &DatabasePool,
+        config: ConnectorManagerConfig,
+        redis_client: RedisClient,
+    ) -> Self {
+        Self {
+            pool: db_pool.pool().clone(),
+            config,
+            redis_client,
+            connector_client: ConnectorClient::new(),
+            sync_run_repo: SyncRunRepository::new(db_pool.pool()),
+            resume_attempts: Arc::new(DashMap::new()),
+            missing_manifest_observations: Arc::new(DashMap::new()),
+        }
+    }
+
+    pub async fn trigger_sync(
+        &self,
+        source_id: &str,
+        sync_type: SyncType,
+        trigger_type: TriggerType,
+    ) -> Result<String, SyncError> {
+        if self
+            .is_sync_class_running(source_id, sync_type.slot_class())
+            .await?
+        {
+            return Err(SyncError::SyncAlreadyRunning(source_id.to_string()));
+        }
+
+        if self.active_sync_count().await? >= self.config.max_concurrent_syncs {
+            return Err(SyncError::ConcurrencyLimitReached);
+        }
+
+        let slot_class = sync_type.slot_class();
+        if self.active_sync_count_for_slot_class(slot_class).await?
+            >= self.config.max_concurrent_syncs_per_type
+        {
+            return Err(SyncError::ConcurrencyLimitReachedForSlot(slot_class));
+        }
+
+        // Get source details
+        let source_repo = SourceRepository::new(&self.pool);
+        let source = source_repo
+            .find_by_id(source_id.to_string())
+            .await
+            .map_err(|e| SyncError::DatabaseError(e.to_string()))?
+            .ok_or_else(|| SyncError::SourceNotFound(source_id.to_string()))?;
+
+        if !source.is_active {
+            return Err(SyncError::SourceInactive(source_id.to_string()));
+        }
+
+        if source.integration_type == IntegrationType::RemoteMcp {
+            return Err(SyncError::SourceDoesNotSync(source_id.to_string()));
+        }
+
+        // Get connector URL from registry
+        let connector_url = get_connector_url_for_source(&self.redis_client, &source.source_type)
+            .await
+            .ok_or_else(|| {
+                SyncError::ConnectorNotConfigured(format!("{:?}", source.source_type))
+            })?;
+
+        // Check last completed sync to determine effective sync type and last_sync_at
+        let last_completed = self
+            .sync_run_repo
+            .get_last_completed_for_source(source_id, None)
+            .await
+            .map_err(|e| SyncError::DatabaseError(e.to_string()))?;
+
+        let effective_sync_type = match sync_type {
+            SyncType::Incremental if last_completed.is_none() => {
+                info!(
+                    "No prior completed sync for source {}; upgrading to full sync",
+                    source_id
+                );
+                SyncType::Full
+            }
+            other => other,
+        };
+
+        let last_sync_at = if effective_sync_type == SyncType::Incremental {
+            last_completed
+                .as_ref()
+                .and_then(|run| run.completed_at)
+                .and_then(|ts| ts.format(&Rfc3339).ok())
+        } else {
+            None
+        };
+
+        let sync_run = self
+            .sync_run_repo
+            .create(source_id, effective_sync_type, &trigger_type.to_string())
+            .await
+            .map_err(|e| match e {
+                DatabaseError::RunningSyncSlotConflict => {
+                    SyncError::SyncAlreadyRunning(source_id.to_string())
+                }
+                other => SyncError::DatabaseError(other.to_string()),
+            })?;
+
+        debug!(
+            sync_run_id = %sync_run.id,
+            source_id = %source_id,
+            sync_type = ?effective_sync_type,
+            trigger_type = %trigger_type,
+            connector_url = %connector_url,
+            "Created sync_run; triggering connector"
+        );
+
+        let sync_request = SyncRequest {
+            sync_run_id: sync_run.id.clone(),
+            source_id: source_id.to_string(),
+            sync_mode: effective_sync_type,
+            last_sync_at,
+            checkpoint: source.checkpoint.clone(),
+            is_resume: false,
+        };
+
+        let trigger_result = timeout(
+            CONNECTOR_TRIGGER_TIMEOUT,
+            self.connector_client
+                .trigger_sync(&connector_url, &sync_request),
+        )
+        .await;
+
+        match trigger_result {
+            Ok(Ok(response)) => {
+                info!(
+                    "Sync triggered for source {}: {:?}",
+                    source_id, response.status
+                );
+                Ok(sync_run.id)
+            }
+            Ok(Err(ClientError::ConnectorError { status: 404, .. }))
+                if effective_sync_type == SyncType::Realtime =>
+            {
+                self.mark_sync_unavailable(&sync_run.id).await?;
+                Err(SyncError::SyncModeUnavailable {
+                    source_id: source_id.to_string(),
+                    sync_type: effective_sync_type,
+                })
+            }
+            Ok(Err(e)) => {
+                self.mark_sync_failed(&sync_run.id, &e.to_string()).await?;
+                Err(SyncError::ConnectorError(e))
+            }
+            Err(_) => {
+                let message = format!(
+                    "Connector trigger timed out after {}s",
+                    CONNECTOR_TRIGGER_TIMEOUT.as_secs()
+                );
+                self.mark_sync_failed(&sync_run.id, &message).await?;
+                Err(SyncError::ConnectorTriggerTimedOut {
+                    sync_run_id: sync_run.id,
+                    timeout_seconds: CONNECTOR_TRIGGER_TIMEOUT.as_secs(),
+                })
+            }
+        }
+    }
+
+    pub async fn cancel_sync(&self, sync_run_id: &str) -> Result<(), SyncError> {
+        let sync_run = self
+            .sync_run_repo
+            .find_by_id(sync_run_id)
+            .await
+            .map_err(|e| SyncError::DatabaseError(e.to_string()))?
+            .ok_or_else(|| SyncError::SyncRunNotFound(sync_run_id.to_string()))?;
+
+        if sync_run.status != SyncStatus::Running {
+            return Err(SyncError::SyncNotRunning(sync_run_id.to_string()));
+        }
+
+        let source_repo = SourceRepository::new(&self.pool);
+        let source = Repository::find_by_id(&source_repo, sync_run.source_id.clone())
+            .await
+            .map_err(|e| SyncError::DatabaseError(e.to_string()))?
+            .ok_or_else(|| SyncError::SourceNotFound(sync_run.source_id.clone()))?;
+
+        let connector_url = get_connector_url_for_source(&self.redis_client, &source.source_type)
+            .await
+            .ok_or_else(|| {
+                SyncError::ConnectorNotConfigured(format!("{:?}", source.source_type))
+            })?;
+
+        // Record the terminal state first: a run that is 'running' here but
+        // slot-free on the connector reads as a lost sync and gets resumed.
+        let updated = self
+            .sync_run_repo
+            .mark_cancelled(sync_run_id)
+            .await
+            .map_err(|e| SyncError::DatabaseError(e.to_string()))?;
+        if !updated {
+            return Err(SyncError::SyncNotRunning(sync_run_id.to_string()));
+        }
+
+        if let Err(e) = self
+            .connector_client
+            .cancel_sync(&connector_url, sync_run_id)
+            .await
+        {
+            warn!("Failed to send cancel request to connector: {}", e);
+        }
+
+        self.resume_attempts.remove(sync_run_id);
+        self.missing_manifest_observations.remove(sync_run_id);
+        info!("Sync {} cancelled", sync_run_id);
+        Ok(())
+    }
+
+    /// Whether *any* sync (Realtime or Scheduled) is running for the source.
+    /// For class-specific checks (e.g., "is a scheduled sync running, ignoring
+    /// any concurrent realtime watcher?") use [`is_sync_class_running`].
+    pub async fn is_sync_running(&self, source_id: &str) -> Result<bool, SyncError> {
+        self.sync_run_repo
+            .get_running_for_source(source_id)
+            .await
+            .map(|r| r.is_some())
+            .map_err(|e| SyncError::DatabaseError(e.to_string()))
+    }
+
+    /// Whether a sync of the given class (Realtime vs Scheduled) is currently
+    /// running for the source. One sync of each class can run concurrently
+    /// per source, so the scheduler uses this to decide whether to trigger a
+    /// scheduled sync without disturbing an in-flight realtime watcher.
+    pub async fn is_sync_class_running(
+        &self,
+        source_id: &str,
+        slot_class: SyncSlotClass,
+    ) -> Result<bool, SyncError> {
+        let types_in_class: &[SyncType] = match slot_class {
+            SyncSlotClass::Realtime => &[SyncType::Realtime],
+            SyncSlotClass::Scheduled => &[SyncType::Full, SyncType::Incremental],
+        };
+        self.sync_run_repo
+            .get_running_for_source_in_types(source_id, types_in_class)
+            .await
+            .map(|r| r.is_some())
+            .map_err(|e| SyncError::DatabaseError(e.to_string()))
+    }
+
+    pub async fn active_sync_count(&self) -> Result<usize, SyncError> {
+        self.sync_run_repo
+            .find_all_running()
+            .await
+            .map(|r| r.len())
+            .map_err(|e| SyncError::DatabaseError(e.to_string()))
+    }
+
+    pub async fn active_sync_count_for_slot_class(
+        &self,
+        slot_class: SyncSlotClass,
+    ) -> Result<usize, SyncError> {
+        self.sync_run_repo
+            .count_running_in_slot_class(slot_class)
+            .await
+            .map(|count| count as usize)
+            .map_err(|e| SyncError::DatabaseError(e.to_string()))
+    }
+
+    /// Probe each running sync's connector to confirm it is actually running.
+    ///
+    /// For every `sync_runs` row with status='running', ask the connector via
+    /// `GET /sync/{sync_run_id}` whether it still has the sync in flight. If the
+    /// connector reports `running: false` (typically because it restarted and
+    /// lost its in-memory state), mark the row as failed and immediately
+    /// trigger a fresh run that resumes from the last persisted
+    /// `connector_state`. Tolerates probe errors / 404s / unregistered
+    /// connectors as no-ops; existing stale-detection is the fallback.
+    pub async fn monitor_running_syncs(&self) -> Result<(), SyncError> {
+        let running = self
+            .sync_run_repo
+            .find_all_running()
+            .await
+            .map_err(|e| SyncError::DatabaseError(e.to_string()))?;
+
+        if running.is_empty() {
+            return Ok(());
+        }
+
+        let source_repo = SourceRepository::new(&self.pool);
+
+        for sync_run in running {
+            let source = match source_repo
+                .find_by_id(sync_run.source_id.clone())
+                .await
+                .map_err(|e| SyncError::DatabaseError(e.to_string()))?
+            {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let connector_url = match get_connector_url_for_source(
+                &self.redis_client,
+                &source.source_type,
+            )
+            .await
+            {
+                Some(url) => {
+                    self.missing_manifest_observations.remove(&sync_run.id);
+                    url
+                }
+                None => {
+                    let observations = {
+                        let mut entry = self
+                            .missing_manifest_observations
+                            .entry(sync_run.id.clone())
+                            .or_insert(0);
+                        *entry += 1;
+                        *entry
+                    };
+
+                    if observations < MISSING_MANIFEST_GRACE_OBSERVATIONS {
+                        warn!(
+                            "No registered connector for sync {} (source_type={:?}); deferring lost-sync handling for grace observation {}/{}",
+                            sync_run.id,
+                            source.source_type,
+                            observations,
+                            MISSING_MANIFEST_GRACE_OBSERVATIONS,
+                        );
+                        continue;
+                    }
+
+                    warn!(
+                        "No registered connector for sync {} (source_type={:?}) after {} observations; treating as lost",
+                        sync_run.id, source.source_type, observations,
+                    );
+                    self.handle_lost_sync(&sync_run.id, &sync_run.source_id)
+                        .await;
+                    continue;
+                }
+            };
+
+            match self
+                .connector_client
+                .get_sync_status(&connector_url, &sync_run.id)
+                .await
+            {
+                Ok(status) if status.running => {
+                    // Healthy observation — clear any prior lost-signal count
+                    // so the attempt cap tracks consecutive failures.
+                    self.resume_attempts.remove(&sync_run.id);
+                }
+                Ok(_) => {
+                    warn!(
+                        "Connector reports sync {} no longer running; reconciling",
+                        sync_run.id
+                    );
+                    self.handle_lost_sync(&sync_run.id, &sync_run.source_id)
+                        .await;
+                }
+                Err(ClientError::ConnectorError { status: 404, .. }) => {
+                    // Connector hasn't implemented the status endpoint
+                    // (e.g., Rust connectors prior to follow-up PR).
+                    // Fall through to existing stale-detection.
+                }
+                Err(e) => {
+                    // Connector reachable-via-Redis but not responding
+                    // (connection refused, timeout, 5xx). Treat same as
+                    // "lost" — attempt counter absorbs transient blips.
+                    warn!(
+                        "Sync status probe failed for {} ({}): {}; treating as lost",
+                        sync_run.id, connector_url, e
+                    );
+                    self.handle_lost_sync(&sync_run.id, &sync_run.source_id)
+                        .await;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Re-trigger `/sync` on the connector for an existing `running` sync_run
+    /// whose connector has lost track of it (typically due to a restart). The
+    /// row stays in `running`; the connector will resume from the
+    /// incrementally-persisted `connector_state`. If we exceed
+    /// MAX_RESUME_ATTEMPTS or the connector keeps refusing, mark the row
+    /// failed so we stop churning.
+    async fn handle_lost_sync(&self, sync_run_id: &str, source_id: &str) {
+        let attempts = {
+            let mut entry = self
+                .resume_attempts
+                .entry(sync_run_id.to_string())
+                .or_insert(0);
+            *entry += 1;
+            *entry
+        };
+
+        if attempts > MAX_RESUME_ATTEMPTS {
+            warn!(
+                "Sync {} exceeded {} resume attempts; marking failed",
+                sync_run_id, MAX_RESUME_ATTEMPTS
+            );
+            if let Err(e) = self
+                .mark_sync_failed(
+                    sync_run_id,
+                    "Connector repeatedly lost sync; auto-resume gave up",
+                )
+                .await
+            {
+                error!("Failed to mark sync {} as failed: {}", sync_run_id, e);
+            }
+            self.resume_attempts.remove(sync_run_id);
+            self.missing_manifest_observations.remove(sync_run_id);
+            return;
+        }
+
+        let source = match SourceRepository::new(&self.pool)
+            .find_by_id(source_id.to_string())
+            .await
+        {
+            Ok(Some(s)) => s,
+            Ok(None) => return,
+            Err(e) => {
+                error!("Failed to load source {}: {}", source_id, e);
+                return;
+            }
+        };
+
+        let connector_url =
+            match get_connector_url_for_source(&self.redis_client, &source.source_type).await {
+                Some(url) => url,
+                None => {
+                    // Connector is still unregistered. Attempt was counted
+                    // above; after MAX_RESUME_ATTEMPTS the cap above will
+                    // mark the row failed.
+                    warn!(
+                        "Cannot resume sync {} — connector for {:?} not registered (attempt {}/{})",
+                        sync_run_id, source.source_type, attempts, MAX_RESUME_ATTEMPTS
+                    );
+                    return;
+                }
+            };
+
+        // Look up the existing run to recover sync_type and the right
+        // last_sync_at to send.
+        let sync_run = match self.sync_run_repo.find_by_id(sync_run_id).await {
+            Ok(Some(r)) => r,
+            Ok(None) => return,
+            Err(e) => {
+                error!("Failed to load sync_run {}: {}", sync_run_id, e);
+                return;
+            }
+        };
+
+        let last_sync_at = if sync_run.sync_type == SyncType::Incremental {
+            match self
+                .sync_run_repo
+                .get_last_completed_for_source(source_id, None)
+                .await
+            {
+                Ok(Some(r)) => r.completed_at.and_then(|ts| ts.format(&Rfc3339).ok()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let sync_request = SyncRequest {
+            sync_run_id: sync_run_id.to_string(),
+            source_id: source_id.to_string(),
+            sync_mode: sync_run.sync_type,
+            last_sync_at,
+            checkpoint: sync_run
+                .checkpoint
+                .clone()
+                .or_else(|| source.checkpoint.clone()),
+            is_resume: true,
+        };
+
+        match timeout(
+            CONNECTOR_TRIGGER_TIMEOUT,
+            self.connector_client
+                .trigger_sync(&connector_url, &sync_request),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {
+                info!(
+                    "Auto-resumed sync {} on connector (attempt {}/{})",
+                    sync_run_id, attempts, MAX_RESUME_ATTEMPTS
+                );
+                // Reset staleness clock so detect_stale_syncs doesn't fire
+                // before the resumed sync starts emitting.
+                if let Err(e) = self.sync_run_repo.update_activity(sync_run_id).await {
+                    warn!(
+                        "Failed to bump activity for resumed sync {}: {}",
+                        sync_run_id, e
+                    );
+                }
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    "Failed to re-trigger sync {} on connector (attempt {}/{}): {}",
+                    sync_run_id, attempts, MAX_RESUME_ATTEMPTS, e
+                );
+            }
+            Err(_) => {
+                warn!(
+                    "Timed out re-triggering sync {} on connector after {}s (attempt {}/{})",
+                    sync_run_id,
+                    CONNECTOR_TRIGGER_TIMEOUT.as_secs(),
+                    attempts,
+                    MAX_RESUME_ATTEMPTS
+                );
+            }
+        }
+    }
+
+    /// Cancel any running sync whose source has been disabled or deleted.
+    /// Runs on every scheduler tick so that disabling a source stops an
+    /// in-progress sync within one tick interval.
+    pub async fn cancel_syncs_for_inactive_sources(&self) -> Result<Vec<String>, SyncError> {
+        let source_repo = SourceRepository::new(&self.pool);
+
+        let inactive_sources = source_repo
+            .find_inactive()
+            .await
+            .map_err(|e| SyncError::DatabaseError(e.to_string()))?;
+
+        if inactive_sources.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let source_type_map: HashMap<String, String> = inactive_sources
+            .iter()
+            .map(|s| (s.id.clone(), s.source_type.clone()))
+            .collect();
+        let source_ids: Vec<String> = inactive_sources.into_iter().map(|s| s.id).collect();
+
+        let running = self
+            .sync_run_repo
+            .find_running_for_sources(&source_ids)
+            .await
+            .map_err(|e| SyncError::DatabaseError(e.to_string()))?;
+
+        if running.is_empty() {
+            return Ok(vec![]);
+        }
+
+        for run in &running {
+            info!(
+                "Cancelling sync {} for inactive/deleted source {}",
+                run.id, run.source_id
+            );
+            if let Some(source_type) = source_type_map.get(&run.source_id) {
+                if let Some(connector_url) =
+                    get_connector_url_for_source(&self.redis_client, source_type).await
+                {
+                    if let Err(e) = self
+                        .connector_client
+                        .cancel_sync(&connector_url, &run.id)
+                        .await
+                    {
+                        warn!(
+                            "Failed to cancel sync {} on connector for inactive source {}: {}",
+                            run.id, run.source_id, e
+                        );
+                    }
+                }
+            }
+        }
+
+        let run_ids: Vec<String> = running.into_iter().map(|r| r.id).collect();
+        self.sync_run_repo
+            .mark_cancelled_many(&run_ids, "Source was disabled")
+            .await
+            .map_err(|e| SyncError::DatabaseError(e.to_string()))
+    }
+
+    /// Sweep running syncs whose `last_activity_at` hasn't advanced within the
+    /// configured timeout — mark them failed and cancel on the connector.
+    /// Realtime watchers rely on periodic `ctx.heartbeat()` calls to stay on
+    /// the right side of this check; a realtime watcher that stops
+    /// heartbeating is genuinely dead and will be (correctly) swept here.
+    pub async fn detect_stale_syncs(&self) -> Result<Vec<String>, SyncError> {
+        let timeout_minutes = self.config.stale_sync_timeout_minutes as i64;
+        let cutoff = OffsetDateTime::now_utc() - time::Duration::minutes(timeout_minutes);
+
+        let stale_syncs: Vec<(String, String, String)> = sqlx::query_as(
+            r#"
+            SELECT sr.id, sr.source_id, s.source_type
+            FROM sync_runs sr
+            JOIN sources s ON sr.source_id = s.id
+            WHERE sr.status = 'running'
+            AND (
+                (sr.last_activity_at IS NOT NULL AND sr.last_activity_at < $1)
+                OR (sr.last_activity_at IS NULL AND sr.created_at < $1)
+            )
+            "#,
+        )
+        .bind(cutoff)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SyncError::DatabaseError(e.to_string()))?;
+
+        let mut marked_stale = Vec::new();
+        for (sync_run_id, source_id, source_type) in stale_syncs {
+            warn!(
+                "Marking stale sync {} for source {}",
+                sync_run_id, source_id
+            );
+
+            if let Some(connector_url) =
+                get_connector_url_for_source(&self.redis_client, &source_type).await
+            {
+                if let Err(e) = self
+                    .connector_client
+                    .cancel_sync(&connector_url, &sync_run_id)
+                    .await
+                {
+                    warn!(
+                        "Failed to cancel stale sync {} on connector: {}",
+                        sync_run_id, e
+                    );
+                }
+            }
+
+            if let Err(e) = self
+                .mark_sync_failed(&sync_run_id, "Sync timed out (no activity detected)")
+                .await
+            {
+                error!("Failed to mark sync as stale: {}", e);
+                continue;
+            }
+
+            marked_stale.push(sync_run_id);
+        }
+
+        Ok(marked_stale)
+    }
+
+    async fn mark_sync_failed(&self, sync_run_id: &str, error: &str) -> Result<(), SyncError> {
+        let updated = self
+            .sync_run_repo
+            .mark_failed(sync_run_id, error)
+            .await
+            .map_err(|e| SyncError::DatabaseError(e.to_string()))?;
+        if !updated {
+            warn!(
+                "Ignoring stale failure transition for non-running sync {}",
+                sync_run_id
+            );
+        }
+
+        self.resume_attempts.remove(sync_run_id);
+        self.missing_manifest_observations.remove(sync_run_id);
+        Ok(())
+    }
+
+    async fn mark_sync_unavailable(&self, sync_run_id: &str) -> Result<(), SyncError> {
+        self.sync_run_repo
+            .mark_cancelled_with_message(sync_run_id, "Realtime sync not available for this source")
+            .await
+            .map_err(|e| SyncError::DatabaseError(e.to_string()))?;
+
+        self.resume_attempts.remove(sync_run_id);
+        self.missing_manifest_observations.remove(sync_run_id);
+        Ok(())
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SyncError {
+    #[error("Source not found: {0}")]
+    SourceNotFound(String),
+
+    #[error("Source is inactive: {0}")]
+    SourceInactive(String),
+
+    #[error("Source does not support data sync: {0}")]
+    SourceDoesNotSync(String),
+
+    #[error("Sync already running for source: {0}")]
+    SyncAlreadyRunning(String),
+
+    #[error("Sync run not found: {0}")]
+    SyncRunNotFound(String),
+
+    #[error("Sync is not running: {0}")]
+    SyncNotRunning(String),
+
+    #[error("Connector not configured for type: {0}")]
+    ConnectorNotConfigured(String),
+
+    #[error("Concurrency limit reached")]
+    ConcurrencyLimitReached,
+
+    #[error("{sync_type} sync is not available for source: {source_id}")]
+    SyncModeUnavailable {
+        source_id: String,
+        sync_type: SyncType,
+    },
+
+    #[error("Concurrency limit reached for {0} syncs")]
+    ConcurrencyLimitReachedForSlot(SyncSlotClass),
+
+    #[error("Connector trigger timed out for sync {sync_run_id} after {timeout_seconds}s")]
+    ConnectorTriggerTimedOut {
+        sync_run_id: String,
+        timeout_seconds: u64,
+    },
+
+    #[error("Database error: {0}")]
+    DatabaseError(String),
+
+    #[error("Connector error: {0}")]
+    ConnectorError(#[from] ClientError),
+}

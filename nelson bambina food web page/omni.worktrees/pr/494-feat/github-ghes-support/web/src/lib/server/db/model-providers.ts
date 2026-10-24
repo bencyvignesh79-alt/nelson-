@@ -1,0 +1,325 @@
+import { eq, and, sql } from 'drizzle-orm'
+import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js'
+import { db } from './index'
+import { modelProviders, models } from './schema'
+import type { ModelProvider, Model } from './schema'
+import { ulid } from 'ulid'
+import { encryptConfig, decryptConfig } from '$lib/server/crypto/encryption'
+
+export const MODEL_PROVIDER_TYPES = [
+    'openai_compatible',
+    'anthropic',
+    'bedrock',
+    'openai',
+    'gemini',
+    'azure_foundry',
+    'vertex_ai',
+] as const
+export type ModelProviderType = (typeof MODEL_PROVIDER_TYPES)[number]
+
+export interface ModelProviderConfig {
+    apiKey?: string | null
+    apiUrl?: string | null
+    regionName?: string | null
+    projectId?: string | null
+    visionMode?: string | null
+}
+
+export interface CreateProviderInput {
+    name: string
+    providerType: ModelProviderType
+    config: ModelProviderConfig
+}
+
+export interface UpdateProviderInput {
+    name?: string
+    config?: ModelProviderConfig
+}
+
+export interface CreateModelInput {
+    modelProviderId: string
+    modelId: string
+    displayName: string
+    isDefault?: boolean
+    isSecondary?: boolean
+}
+
+export type ModelRole = 'default' | 'secondary' | 'unassigned'
+
+export interface ModelSeed {
+    modelId: string
+    displayName: string
+}
+
+export const PREDEFINED_MODELS: Record<
+    ModelProviderType,
+    { modelId: string; displayName: string }[]
+> = {
+    anthropic: [
+        { modelId: 'claude-opus-5', displayName: 'Claude Opus 5' },
+        { modelId: 'claude-sonnet-5', displayName: 'Claude Sonnet 5' },
+        { modelId: 'claude-haiku-4-5-20251001', displayName: 'Claude Haiku 4.5' },
+    ],
+    openai: [
+        { modelId: 'gpt-5.6', displayName: 'GPT-5.6' },
+        { modelId: 'gpt-5.2', displayName: 'GPT-5.2' },
+        { modelId: 'gpt-5-mini', displayName: 'GPT-5 Mini' },
+    ],
+    bedrock: [
+        { modelId: 'anthropic.claude-opus-5', displayName: 'Claude Opus 5' },
+        { modelId: 'anthropic.claude-sonnet-5', displayName: 'Claude Sonnet 5' },
+        { modelId: 'anthropic.claude-haiku-4-5-20251001-v1:0', displayName: 'Claude Haiku 4.5' },
+        { modelId: 'amazon.nova-2-lite-v1:0', displayName: 'Amazon Nova 2 Lite' },
+    ],
+    openai_compatible: [],
+    gemini: [
+        { modelId: 'gemini-3.6-flash', displayName: 'Gemini 3.6 Flash' },
+        { modelId: 'gemini-3.5-flash', displayName: 'Gemini 3.5 Flash' },
+        { modelId: 'gemini-3.5-flash-lite', displayName: 'Gemini 3.5 Flash-Lite' },
+        { modelId: 'gemini-3.1-pro-preview', displayName: 'Gemini 3.1 Pro' },
+    ],
+    azure_foundry: [],
+    vertex_ai: [
+        { modelId: 'claude-opus-5', displayName: 'Claude Opus 5' },
+        { modelId: 'claude-sonnet-5', displayName: 'Claude Sonnet 5' },
+        { modelId: 'gemini-3.6-flash', displayName: 'Gemini 3.6 Flash' },
+        { modelId: 'gemini-3.5-flash', displayName: 'Gemini 3.5 Flash' },
+    ],
+}
+
+// --- Provider CRUD ---
+
+export async function listActiveProviders(): Promise<ModelProvider[]> {
+    const rows = await db
+        .select()
+        .from(modelProviders)
+        .where(eq(modelProviders.isDeleted, false))
+        .orderBy(modelProviders.createdAt)
+    return rows.map((row) => ({ ...row, config: decryptConfig(row.config) }))
+}
+
+export async function getProvider(id: string): Promise<ModelProvider | null> {
+    const [provider] = await db
+        .select()
+        .from(modelProviders)
+        .where(eq(modelProviders.id, id))
+        .limit(1)
+    if (!provider) return null
+    return { ...provider, config: decryptConfig(provider.config) }
+}
+
+export async function createProvider(input: CreateProviderInput): Promise<ModelProvider> {
+    const [provider] = await db
+        .insert(modelProviders)
+        .values({
+            id: ulid(),
+            name: input.name,
+            providerType: input.providerType,
+            config: encryptConfig(input.config as Record<string, unknown>),
+        })
+        .returning()
+
+    return { ...provider, config: decryptConfig(provider.config) }
+}
+
+export async function updateProvider(
+    id: string,
+    input: UpdateProviderInput,
+): Promise<ModelProvider | null> {
+    const values: Record<string, unknown> = { updatedAt: new Date() }
+    if (input.name !== undefined) values.name = input.name
+    if (input.config !== undefined)
+        values.config = encryptConfig(input.config as Record<string, unknown>)
+
+    const [updated] = await db
+        .update(modelProviders)
+        .set(values)
+        .where(eq(modelProviders.id, id))
+        .returning()
+
+    if (!updated) return null
+    return { ...updated, config: decryptConfig(updated.config) }
+}
+
+export async function deleteProvider(id: string): Promise<boolean> {
+    const [updated] = await db
+        .update(modelProviders)
+        .set({ isDeleted: true, updatedAt: new Date() })
+        .where(eq(modelProviders.id, id))
+        .returning()
+
+    return !!updated
+}
+
+// --- Model CRUD ---
+
+export async function listModelsByProvider(providerId: string): Promise<Model[]> {
+    return await db
+        .select()
+        .from(models)
+        .where(and(eq(models.modelProviderId, providerId), eq(models.isDeleted, false)))
+        .orderBy(models.createdAt)
+}
+
+export async function listAllActiveModels(): Promise<
+    (Model & { providerType: string; providerName: string })[]
+> {
+    const rows = await db
+        .select({
+            id: models.id,
+            modelProviderId: models.modelProviderId,
+            modelId: models.modelId,
+            displayName: models.displayName,
+            isDefault: models.isDefault,
+            isSecondary: models.isSecondary,
+            isDeleted: models.isDeleted,
+            createdAt: models.createdAt,
+            updatedAt: models.updatedAt,
+            providerType: modelProviders.providerType,
+            providerName: modelProviders.name,
+        })
+        .from(models)
+        .innerJoin(modelProviders, eq(models.modelProviderId, modelProviders.id))
+        .where(and(eq(models.isDeleted, false), eq(modelProviders.isDeleted, false)))
+        .orderBy(models.createdAt)
+
+    return rows
+}
+
+export async function getModel(id: string): Promise<Model | null> {
+    const [model] = await db.select().from(models).where(eq(models.id, id)).limit(1)
+    return model || null
+}
+
+const MODEL_ROLE_LOCK_KEY = 829174
+type ModelDatabase = PostgresJsDatabase<typeof import('./schema')>
+
+export async function createModel(input: CreateModelInput): Promise<Model> {
+    const isDefault = input.isDefault === true
+    const isSecondary = !isDefault && input.isSecondary === true
+
+    return await db.transaction(async (tx) => {
+        await tx.execute(sql`SELECT pg_advisory_xact_lock(${MODEL_ROLE_LOCK_KEY})`)
+
+        if (isDefault) {
+            await tx
+                .update(models)
+                .set({ isDefault: false, updatedAt: new Date() })
+                .where(eq(models.isDefault, true))
+        }
+
+        if (isSecondary) {
+            await tx
+                .update(models)
+                .set({ isSecondary: false, updatedAt: new Date() })
+                .where(eq(models.isSecondary, true))
+        }
+
+        const [model] = await tx
+            .insert(models)
+            .values({
+                id: ulid(),
+                modelProviderId: input.modelProviderId,
+                modelId: input.modelId,
+                displayName: input.displayName,
+                isDefault,
+                isSecondary,
+            })
+            .returning()
+
+        return model
+    })
+}
+
+export async function deleteModel(id: string): Promise<boolean> {
+    const [updated] = await db
+        .update(models)
+        .set({ isDeleted: true, isDefault: false, isSecondary: false, updatedAt: new Date() })
+        .where(eq(models.id, id))
+        .returning()
+
+    return !!updated
+}
+
+export async function setModelRole(
+    id: string,
+    role: ModelRole,
+    database: ModelDatabase = db,
+): Promise<boolean> {
+    return await database.transaction(async (tx) => {
+        await tx.execute(sql`SELECT pg_advisory_xact_lock(${MODEL_ROLE_LOCK_KEY})`)
+
+        const [target] = await tx
+            .select({ id: models.id })
+            .from(models)
+            .where(and(eq(models.id, id), eq(models.isDeleted, false)))
+            .limit(1)
+        if (!target) return false
+
+        if (role === 'default') {
+            await tx
+                .update(models)
+                .set({ isDefault: false, updatedAt: new Date() })
+                .where(eq(models.isDefault, true))
+        } else if (role === 'secondary') {
+            await tx
+                .update(models)
+                .set({ isSecondary: false, updatedAt: new Date() })
+                .where(eq(models.isSecondary, true))
+        }
+
+        const [updated] = await tx
+            .update(models)
+            .set({
+                isDefault: role === 'default',
+                isSecondary: role === 'secondary',
+                updatedAt: new Date(),
+            })
+            .where(eq(models.id, id))
+            .returning({ id: models.id })
+
+        return !!updated
+    })
+}
+
+export async function setDefaultModel(id: string): Promise<boolean> {
+    return await setModelRole(id, 'default')
+}
+
+export async function setSecondaryModel(id: string): Promise<boolean> {
+    return await setModelRole(id, 'secondary')
+}
+
+export async function createModelSeeds(
+    providerId: string,
+    modelSeeds: ModelSeed[],
+): Promise<Model[]> {
+    if (modelSeeds.length === 0) return []
+
+    const hasExistingDefault = await db
+        .select({ id: models.id })
+        .from(models)
+        .where(and(eq(models.isDefault, true), eq(models.isDeleted, false)))
+        .limit(1)
+
+    const createdModels: Model[] = []
+    for (let i = 0; i < modelSeeds.length; i++) {
+        const isDefault = i === 0 && hasExistingDefault.length === 0
+        const model = await createModel({
+            modelProviderId: providerId,
+            modelId: modelSeeds[i].modelId,
+            displayName: modelSeeds[i].displayName,
+            isDefault,
+        })
+        createdModels.push(model)
+    }
+
+    return createdModels
+}
+
+export async function createPredefinedModels(
+    providerId: string,
+    providerType: ModelProviderType,
+): Promise<Model[]> {
+    return await createModelSeeds(providerId, PREDEFINED_MODELS[providerType] ?? [])
+}

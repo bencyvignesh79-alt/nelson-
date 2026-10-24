@@ -1,0 +1,33 @@
+[package]
+name = "omni-filesystem-connector"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "omni-filesystem-connector"
+path = "src/main.rs"
+
+[lib]
+name = "omni_filesystem_connector"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { workspace = true }
+omni-connector-sdk = { path = "../../sdk/rust" }
+async-trait = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+dotenvy = { workspace = true }
+anyhow = { workspace = true }
+time = { workspace = true }
+notify = "6.0"
+walkdir = "2.3"
+mime_guess = "2.0"
+
+[dev-dependencies]
+tempfile = "3"

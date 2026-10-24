@@ -1,0 +1,477 @@
+import { sql } from 'drizzle-orm'
+import {
+    pgTable,
+    text,
+    timestamp,
+    boolean,
+    jsonb,
+    bigint,
+    integer,
+    index,
+} from 'drizzle-orm/pg-core'
+import type { MessageParam } from '@anthropic-ai/sdk/resources/messages.js'
+import type { ChatStreamError } from '$lib/types/message.js'
+
+export const user = pgTable('users', {
+    id: text('id').primaryKey(),
+    email: text('email').notNull().unique(),
+    passwordHash: text('password_hash'),
+    role: text('role').notNull().default('user'),
+    isActive: boolean('is_active').notNull().default(true),
+    authMethod: text('auth_method').notNull().default('password'),
+    domain: text('domain'),
+    mustChangePassword: boolean('must_change_password').notNull().default(false),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+})
+
+export const configuration = pgTable('configuration', {
+    scope: text('scope').notNull(),
+    userId: text('user_id').references(() => user.id, { onDelete: 'cascade' }),
+    key: text('key').notNull(),
+    value: jsonb('value').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+})
+
+export const sources = pgTable('sources', {
+    id: text('id').primaryKey(),
+    name: text('name').notNull(),
+    sourceType: text('source_type').notNull(),
+    integrationType: text('integration_type').notNull().default('connector'),
+    config: jsonb('config').notNull().default({}),
+    isActive: boolean('is_active').notNull().default(true),
+    isDeleted: boolean('is_deleted').notNull().default(false),
+    /// 'org' = admin-set-up source shared by all users; 'user' = personal source.
+    scope: text('scope').notNull().default('user'),
+    userFilterMode: text('user_filter_mode').notNull().default('all'),
+    userWhitelist: jsonb('user_whitelist').notNull().default('[]'),
+    userBlacklist: jsonb('user_blacklist').notNull().default('[]'),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    createdBy: text('created_by')
+        .notNull()
+        .references(() => user.id),
+    syncIntervalSeconds: integer('sync_interval_seconds'),
+})
+
+export const documents = pgTable('documents', {
+    id: text('id').primaryKey(),
+    sourceId: text('source_id')
+        .notNull()
+        .references(() => sources.id, { onDelete: 'cascade' }),
+    externalId: text('external_id').notNull(),
+    title: text('title').notNull(),
+    content: text('content'),
+    contentType: text('content_type'),
+    fileSize: bigint('file_size', { mode: 'number' }),
+    fileExtension: text('file_extension'),
+    url: text('url'),
+    parentId: text('parent_id'),
+    metadata: jsonb('metadata').notNull().default({}),
+    permissions: jsonb('permissions').notNull().default([]),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    lastIndexedAt: timestamp('last_indexed_at', { withTimezone: true, mode: 'date' })
+        .notNull()
+        .defaultNow(),
+})
+
+export const embeddings = pgTable('embeddings', {
+    id: text('id').primaryKey(),
+    documentId: text('document_id')
+        .notNull()
+        .references(() => documents.id, { onDelete: 'cascade' }),
+    chunkIndex: integer('chunk_index').notNull(),
+    chunkText: text('chunk_text').notNull(),
+    modelName: text('model_name').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+})
+
+export const serviceCredentials = pgTable('service_credentials', {
+    id: text('id').primaryKey(),
+    sourceId: text('source_id')
+        .notNull()
+        .references(() => sources.id, { onDelete: 'cascade' }),
+    /// NULL = org-wide cred (used for sync and reads).
+    /// NOT NULL = per-user cred for an org-wide source (used by that user's MCP write tools).
+    userId: text('user_id').references(() => user.id, { onDelete: 'cascade' }),
+    provider: text('provider').notNull(),
+    authType: text('auth_type').notNull(),
+    principalEmail: text('principal_email'),
+    credentials: jsonb('credentials').notNull(),
+    config: jsonb('config').notNull().default({}),
+    expiresAt: timestamp('expires_at', { withTimezone: true, mode: 'date' }),
+    lastValidatedAt: timestamp('last_validated_at', { withTimezone: true, mode: 'date' }),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+})
+
+export const connectorEventsQueue = pgTable('connector_events_queue', {
+    id: text('id').primaryKey(),
+    sourceId: text('source_id').notNull(),
+    eventType: text('event_type').notNull(),
+    payload: jsonb('payload').notNull(),
+    status: text('status').notNull().default('pending'),
+    retryCount: integer('retry_count').default(0),
+    maxRetries: integer('max_retries').default(3),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    processedAt: timestamp('processed_at', { withTimezone: true, mode: 'date' }),
+    errorMessage: text('error_message'),
+})
+
+export const syncRuns = pgTable('sync_runs', {
+    id: text('id').primaryKey(),
+    sourceId: text('source_id')
+        .notNull()
+        .references(() => sources.id, { onDelete: 'cascade' }),
+    syncType: text('sync_type').notNull(),
+    startedAt: timestamp('started_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    completedAt: timestamp('completed_at', { withTimezone: true, mode: 'date' }),
+    status: text('status').notNull().default('running'),
+    documentsScanned: integer('documents_scanned').default(0),
+    documentsProcessed: integer('documents_processed').default(0),
+    documentsUpdated: integer('documents_updated').default(0),
+    errorMessage: text('error_message'),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+})
+
+export const approvedDomains = pgTable('approved_domains', {
+    id: text('id').primaryKey(),
+    domain: text('domain').notNull().unique(),
+    approvedBy: text('approved_by')
+        .notNull()
+        .references(() => user.id),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+})
+
+export const magicLinks = pgTable('magic_links', {
+    id: text('id').primaryKey(),
+    email: text('email').notNull(),
+    tokenHash: text('token_hash').notNull().unique(),
+    expiresAt: timestamp('expires_at', { withTimezone: true, mode: 'date' }).notNull(),
+    usedAt: timestamp('used_at', { withTimezone: true, mode: 'date' }),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    userId: text('user_id').references(() => user.id),
+})
+
+export const modelProviders = pgTable('model_providers', {
+    id: text('id').primaryKey(),
+    name: text('name').notNull(),
+    providerType: text('provider_type').notNull(),
+    config: jsonb('config').notNull().default({}),
+    isDeleted: boolean('is_deleted').notNull().default(false),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+})
+
+export const models = pgTable('models', {
+    id: text('id').primaryKey(),
+    modelProviderId: text('model_provider_id')
+        .notNull()
+        .references(() => modelProviders.id, { onDelete: 'cascade' }),
+    modelId: text('model_id').notNull(),
+    displayName: text('display_name').notNull(),
+    isDefault: boolean('is_default').notNull().default(false),
+    isSecondary: boolean('is_secondary').notNull().default(false),
+    isDeleted: boolean('is_deleted').notNull().default(false),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+})
+
+export const projects = pgTable('projects', {
+    id: text('id').primaryKey(),
+    userId: text('user_id')
+        .notNull()
+        .references(() => user.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    description: text('description'),
+    instructions: text('instructions'),
+    isArchived: boolean('is_archived').notNull().default(false),
+    isDeleted: boolean('is_deleted').notNull().default(false),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+})
+
+export const chats = pgTable('chats', {
+    id: text('id').primaryKey(),
+    userId: text('user_id')
+        .notNull()
+        .references(() => user.id, { onDelete: 'cascade' }),
+    title: text('title'),
+    isStarred: boolean('is_starred').notNull().default(false),
+    modelId: text('model_id').references(() => models.id, {
+        onDelete: 'set null',
+    }),
+    agentId: text('agent_id').references(() => agents.id, { onDelete: 'set null' }),
+    projectId: text('project_id').references(() => projects.id, { onDelete: 'set null' }),
+    isDeleted: boolean('is_deleted').notNull().default(false),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+})
+
+// Standing context attachments for a project. `uploadId` has a DB-level FK to
+// the `uploads` table (owned by omni-ai, not modeled in this drizzle schema).
+export const projectAttachments = pgTable('project_attachments', {
+    id: text('id').primaryKey(),
+    projectId: text('project_id')
+        .notNull()
+        .references(() => projects.id, { onDelete: 'cascade' }),
+    attachmentType: text('attachment_type').notNull(),
+    uploadId: text('upload_id'),
+    documentId: text('document_id'),
+    addedAt: timestamp('added_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+})
+
+export const chatMessages = pgTable('chat_messages', {
+    id: text('id').primaryKey(),
+    chatId: text('chat_id')
+        .notNull()
+        .references(() => chats.id, { onDelete: 'cascade' }),
+    parentId: text('parent_id'),
+    messageSeqNum: integer('message_seq_num').notNull(),
+    message: jsonb('message').$type<MessageParam>().notNull(),
+    contentText: text('content_text'),
+    // Error payload for a failed assistant turn; null when the turn succeeded.
+    error: jsonb('error').$type<ChatStreamError | null>(),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+})
+
+export const responseFeedback = pgTable('response_feedback', {
+    id: text('id').primaryKey(),
+    messageId: text('message_id')
+        .notNull()
+        .references(() => chatMessages.id, { onDelete: 'cascade' }),
+    userId: text('user_id')
+        .notNull()
+        .references(() => user.id, { onDelete: 'cascade' }),
+    feedbackType: text('feedback_type').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+})
+
+export const authProviders = pgTable('auth_providers', {
+    provider: text('provider').primaryKey(),
+    enabled: boolean('enabled').notNull().default(false),
+    config: jsonb('config').notNull().default({}),
+    updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    updatedBy: text('updated_by').references(() => user.id),
+})
+
+export const connectorConfigs = pgTable('connector_configs', {
+    provider: text('provider').primaryKey(),
+    config: jsonb('config').notNull().default({}),
+    updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    updatedBy: text('updated_by').references(() => user.id),
+})
+
+export const toolApprovals = pgTable('tool_approvals', {
+    id: text('id').primaryKey(),
+    chatId: text('chat_id')
+        .notNull()
+        .references(() => chats.id, { onDelete: 'cascade' }),
+    userId: text('user_id')
+        .notNull()
+        .references(() => user.id, { onDelete: 'cascade' }),
+    toolName: text('tool_name').notNull(),
+    toolInput: jsonb('tool_input').notNull(),
+    approvalType: text('approval_type').notNull().default('approval'),
+    toolCallId: text('tool_call_id'),
+    sourceId: text('source_id'),
+    sourceType: text('source_type'),
+    provider: text('provider'),
+    oauthStartUrl: text('oauth_start_url'),
+    status: text('status').notNull().default('pending'),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    resolvedAt: timestamp('resolved_at', { withTimezone: true, mode: 'date' }),
+    resolvedBy: text('resolved_by').references(() => user.id),
+})
+
+export const embeddingProviders = pgTable('embedding_providers', {
+    id: text('id').primaryKey(),
+    name: text('name').notNull(),
+    providerType: text('provider_type').notNull(),
+    config: jsonb('config').notNull().default({}),
+    isCurrent: boolean('is_current').notNull().default(false),
+    isDeleted: boolean('is_deleted').notNull().default(false),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+})
+
+export const emailProviders = pgTable('email_providers', {
+    id: text('id').primaryKey(),
+    name: text('name').notNull(),
+    providerType: text('provider_type').notNull(),
+    config: jsonb('config').notNull().default({}),
+    isCurrent: boolean('is_current').notNull().default(false),
+    isDeleted: boolean('is_deleted').notNull().default(false),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+})
+
+export const webSearchProviders = pgTable('web_search_providers', {
+    id: text('id').primaryKey(),
+    name: text('name').notNull(),
+    providerType: text('provider_type').notNull(),
+    config: jsonb('config').notNull().default({}),
+    isCurrent: boolean('is_current').notNull().default(false),
+    isDeleted: boolean('is_deleted').notNull().default(false),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+})
+
+export const webFetchProviders = pgTable('web_fetch_providers', {
+    id: text('id').primaryKey(),
+    name: text('name').notNull(),
+    providerType: text('provider_type').notNull(),
+    config: jsonb('config').notNull().default({}),
+    isCurrent: boolean('is_current').notNull().default(false),
+    isDeleted: boolean('is_deleted').notNull().default(false),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+})
+
+export const agents = pgTable('agents', {
+    id: text('id').primaryKey(),
+    userId: text('user_id')
+        .notNull()
+        .references(() => user.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    instructions: text('instructions').notNull(),
+    agentType: text('agent_type').notNull().default('user'),
+    scheduleType: text('schedule_type').notNull(),
+    scheduleValue: text('schedule_value').notNull(),
+    modelId: text('model_id').references(() => models.id, { onDelete: 'set null' }),
+    allowedSources: jsonb('allowed_sources').notNull().default([]),
+    allowedActions: jsonb('allowed_actions').notNull().default([]),
+    isEnabled: boolean('is_enabled').notNull().default(true),
+    isDeleted: boolean('is_deleted').notNull().default(false),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+})
+
+export const agentRuns = pgTable('agent_runs', {
+    id: text('id').primaryKey(),
+    agentId: text('agent_id')
+        .notNull()
+        .references(() => agents.id, { onDelete: 'cascade' }),
+    status: text('status').notNull().default('pending'),
+    triggerType: text('trigger_type').notNull().default('manual'),
+    startedAt: timestamp('started_at', { withTimezone: true, mode: 'date' }),
+    completedAt: timestamp('completed_at', { withTimezone: true, mode: 'date' }),
+    claimToken: text('claim_token'),
+    leaseExpiresAt: timestamp('lease_expires_at', { withTimezone: true, mode: 'date' }),
+    heartbeatAt: timestamp('heartbeat_at', { withTimezone: true, mode: 'date' }),
+    attemptCount: integer('attempt_count').notNull().default(0),
+    maxAttempts: integer('max_attempts').notNull().default(3),
+    summary: text('summary'),
+    errorMessage: text('error_message'),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+})
+
+export const agentRunLogs = pgTable('agent_run_logs', {
+    id: text('id').primaryKey(),
+    runId: text('run_id')
+        .notNull()
+        .references(() => agentRuns.id, { onDelete: 'cascade' }),
+    messageSeqNum: integer('message_seq_num').notNull(),
+    message: jsonb('message').$type<MessageParam>().notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+})
+
+export const compactions = pgTable('compactions', {
+    id: text('id').primaryKey(),
+    targetType: text('target_type').notNull(),
+    chatId: text('chat_id').references(() => chats.id, { onDelete: 'cascade' }),
+    agentRunId: text('agent_run_id').references(() => agentRuns.id, { onDelete: 'cascade' }),
+    anchorMessageId: text('anchor_message_id').references(() => chatMessages.id, {
+        onDelete: 'cascade',
+    }),
+    anchorLogId: text('anchor_log_id').references(() => agentRunLogs.id, { onDelete: 'cascade' }),
+    compactedThroughSeqNum: integer('compacted_through_seq_num').notNull(),
+    previousCompactionId: text('previous_compaction_id'),
+    summary: text('summary').notNull(),
+    summaryMessage: jsonb('summary_message').$type<MessageParam>().notNull(),
+    estimatedInputTokens: integer('estimated_input_tokens'),
+    actualInputTokens: integer('actual_input_tokens'),
+    estimatedSummaryTokens: integer('estimated_summary_tokens'),
+    actualSummaryTokens: integer('actual_summary_tokens'),
+    metadata: jsonb('metadata').notNull().default({}),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+})
+
+export const skills = pgTable(
+    'skills',
+    {
+        id: text('id').primaryKey(),
+        ownerId: text('owner_id')
+            .notNull()
+            .references(() => user.id, { onDelete: 'cascade' }),
+        name: text('name').notNull(),
+        description: text('description').notNull(),
+        instructions: text('instructions').notNull(),
+        visibility: text('visibility').$type<'private' | 'public'>().notNull().default('private'),
+        createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' })
+            .notNull()
+            .defaultNow(),
+        updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' })
+            .notNull()
+            .defaultNow(),
+    },
+    (table) => [
+        index('idx_skills_owner_updated').on(table.ownerId, table.updatedAt.desc()),
+        index('idx_skills_public_updated')
+            .on(table.updatedAt.desc())
+            .where(sql`${table.visibility} = 'public'`),
+    ],
+)
+
+export const apiKeys = pgTable('api_keys', {
+    id: text('id').primaryKey(),
+    userId: text('user_id')
+        .notNull()
+        .references(() => user.id, { onDelete: 'cascade' }),
+    keyHash: text('key_hash').notNull().unique(),
+    keyPrefix: text('key_prefix').notNull(),
+    name: text('name').notNull(),
+    lastUsedAt: timestamp('last_used_at', { withTimezone: true, mode: 'date' }),
+    expiresAt: timestamp('expires_at', { withTimezone: true, mode: 'date' }),
+    allowedSources: jsonb('allowed_sources').$type<string[] | null>().default(null),
+    scope: text('scope').notNull().default('public'),
+    isActive: boolean('is_active').notNull().default(true),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+})
+
+export type User = typeof user.$inferSelect
+export type Source = typeof sources.$inferSelect
+export type Document = typeof documents.$inferSelect
+export type Embedding = typeof embeddings.$inferSelect
+export type ServiceCredential = typeof serviceCredentials.$inferSelect
+export type ConnectorEventsQueue = typeof connectorEventsQueue.$inferSelect
+export type SyncRun = typeof syncRuns.$inferSelect
+export type ApprovedDomain = typeof approvedDomains.$inferSelect
+export type MagicLink = typeof magicLinks.$inferSelect
+export type ModelProvider = typeof modelProviders.$inferSelect
+export type Model = typeof models.$inferSelect
+export type Chat = typeof chats.$inferSelect
+export type ChatMessage = typeof chatMessages.$inferSelect
+export type Project = typeof projects.$inferSelect
+export type ProjectAttachment = typeof projectAttachments.$inferSelect
+export type Compaction = typeof compactions.$inferSelect
+export type ResponseFeedback = typeof responseFeedback.$inferSelect
+export type AuthProvider = typeof authProviders.$inferSelect
+export type ConnectorConfig = typeof connectorConfigs.$inferSelect
+export type EmbeddingProvider = typeof embeddingProviders.$inferSelect
+export type ToolApproval = typeof toolApprovals.$inferSelect
+export type EmailProvider = typeof emailProviders.$inferSelect
+export type WebSearchProvider = typeof webSearchProviders.$inferSelect
+export type WebFetchProvider = typeof webFetchProviders.$inferSelect
+export type Agent = typeof agents.$inferSelect
+export type AgentRun = typeof agentRuns.$inferSelect
+export type AgentRunLog = typeof agentRunLogs.$inferSelect
+export type Skill = typeof skills.$inferSelect
+
+export type ApiKey = typeof apiKeys.$inferSelect

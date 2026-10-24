@@ -1,0 +1,48 @@
+[package]
+name = "omni-google-connector"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "omni-google-connector"
+path = "src/main.rs"
+
+[lib]
+name = "omni_google_connector"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { workspace = true }
+omni-connector-sdk = { path = "../../sdk/rust" }
+async-trait = { workspace = true }
+axum = { workspace = true }
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+dotenvy = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+base64 = "0.21"
+uuid = { workspace = true }
+time = { workspace = true }
+futures = { workspace = true }
+governor = { workspace = true }
+nonzero_ext = { workspace = true }
+rand = { workspace = true }
+urlencoding = "2.1"
+# HTTP server dependencies
+dashmap = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+
+[dev-dependencies]
+shared = { path = "../../shared" }
+omni-connector-manager = { path = "../../services/connector-manager" }
+redis = { workspace = true }

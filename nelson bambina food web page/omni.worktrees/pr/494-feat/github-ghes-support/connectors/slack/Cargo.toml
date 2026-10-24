@@ -1,0 +1,46 @@
+[package]
+name = "omni-slack-connector"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "omni-slack-connector"
+path = "src/main.rs"
+
+[lib]
+name = "omni_slack_connector"
+path = "src/lib.rs"
+
+[dependencies]
+omni-connector-sdk = { path = "../../sdk/rust" }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+dashmap = { workspace = true }
+dotenvy = { workspace = true }
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+rustls = "0.23"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde_path_to_error = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tower = { workspace = true }
+tower-http = { workspace = true, features = ["cors", "trace"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+uuid = { workspace = true, features = ["v4", "serde"] }
+tokio-tungstenite = { workspace = true }
+tokio-util = { workspace = true }
+futures-util = { workspace = true }
+
+[dev-dependencies]
+shared = { path = "../../shared" }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true, features = ["postgres", "redis"] }
+omni-connector-manager = { path = "../../services/connector-manager" }
+redis = { workspace = true }
+sqlx = { workspace = true, features = ["runtime-tokio-rustls", "postgres"] }

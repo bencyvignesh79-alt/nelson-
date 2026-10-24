@@ -1,0 +1,529 @@
+import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
+import request from "supertest";
+import { http, HttpResponse } from "msw";
+import { setupServer } from "msw/node";
+import { Connector } from "../src/connector.js";
+import { createServer } from "../src/server.js";
+import type { SyncContext } from "../src/context.js";
+import { ActionResponse } from "../src/models.js";
+
+const MANAGER_URL = "http://test-connector-manager:8080";
+
+class MockConnector extends Connector {
+  name = "mock-connector";
+  version = "1.0.0";
+  syncModes = ["full", "incremental"];
+
+  syncFn: ((ctx: SyncContext) => Promise<void>) | null = null;
+
+  async sync(
+    _sourceConfig: Record<string, unknown>,
+    _credentials: Record<string, unknown>,
+    _state: Record<string, unknown> | null,
+    ctx: SyncContext,
+  ): Promise<void> {
+    if (this.syncFn) {
+      await this.syncFn(ctx);
+    }
+  }
+}
+
+const mockServer = setupServer(
+  http.get(`${MANAGER_URL}/sdk/source/:sourceId/sync-config`, () =>
+    HttpResponse.json({
+      config: { folder_id: "test-folder" },
+      credentials: { access_token: "test-token" },
+      connector_state: { cursor: "test-cursor" },
+    }),
+  ),
+  http.post(`${MANAGER_URL}/sdk/events`, () =>
+    HttpResponse.json({ success: true }),
+  ),
+  http.post(`${MANAGER_URL}/sdk/content`, () =>
+    HttpResponse.json({ content_id: "content-123" }),
+  ),
+  http.post(`${MANAGER_URL}/sdk/sync/:id/heartbeat`, () =>
+    HttpResponse.json({ success: true }),
+  ),
+  http.post(`${MANAGER_URL}/sdk/sync/:id/scanned`, () =>
+    HttpResponse.json({ success: true }),
+  ),
+  http.post(`${MANAGER_URL}/sdk/sync/:id/complete`, () =>
+    HttpResponse.json({ success: true }),
+  ),
+  http.post(`${MANAGER_URL}/sdk/sync/:id/fail`, () =>
+    HttpResponse.json({ success: true }),
+  ),
+  http.post(`${MANAGER_URL}/sdk/register`, () =>
+    HttpResponse.json({ success: true }),
+  ),
+);
+
+beforeAll(() => {
+  vi.stubEnv("CONNECTOR_MANAGER_URL", MANAGER_URL);
+  vi.stubEnv("CONNECTOR_HOST_NAME", "localhost");
+  vi.stubEnv("PORT", "8000");
+  mockServer.listen({ onUnhandledRequest: "bypass" });
+});
+
+afterAll(() => {
+  vi.unstubAllEnvs();
+  mockServer.close();
+});
+
+describe("Connector Server", () => {
+  describe("GET /health", () => {
+    it("returns healthy status", async () => {
+      const connector = new MockConnector();
+      const app = createServer(connector);
+
+      const response = await request(app).get("/health");
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({
+        status: "healthy",
+        service: "mock-connector",
+      });
+    });
+  });
+
+  describe("GET /manifest", () => {
+    it("returns connector manifest", async () => {
+      const connector = new MockConnector();
+      const app = createServer(connector);
+
+      const response = await request(app).get("/manifest");
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({
+        name: "mock-connector",
+        display_name: "mock-connector",
+        version: "1.0.0",
+        sync_modes: ["full", "incremental"],
+        connector_id: "mock-connector",
+        connector_url: "http://localhost:8000",
+        integration_type: "connector",
+        description: "",
+        actions: [],
+        search_operators: [],
+        mcp_enabled: false,
+        mcp_catalog_loaded: false,
+        read_only: false,
+        resources: [],
+        prompts: [],
+        skills: [],
+        source_capabilities: [],
+      });
+    });
+  });
+
+  describe("POST /oauth/validate", () => {
+    const requestBody = () => ({
+      source_id: "source-456",
+      provider: "mock",
+      credentials: { access_token: "token" },
+      flow: "org_source",
+      metadata: {},
+      source: {
+        id: "source-456",
+        name: "Mock Source",
+        source_type: "mock",
+        config: {},
+        is_active: true,
+      },
+    });
+
+    it("returns an empty binding by default", async () => {
+      const connector = new MockConnector();
+      const app = createServer(connector);
+
+      const response = await request(app)
+        .post("/oauth/validate")
+        .send(requestBody());
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({ source_binding: null });
+    });
+
+    it("returns the connector's binding", async () => {
+      const connector = new MockConnector();
+      vi.spyOn(connector, "validateOauthCredential").mockResolvedValue({
+        organization_id: "00D123",
+      });
+      const app = createServer(connector);
+
+      const response = await request(app)
+        .post("/oauth/validate")
+        .send(requestBody());
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({
+        source_binding: { organization_id: "00D123" },
+      });
+    });
+
+    it("surfaces connector rejection as a 400", async () => {
+      const connector = new MockConnector();
+      vi.spyOn(connector, "validateOauthCredential").mockRejectedValue(
+        new Error("OAuth organization does not match the source"),
+      );
+      const app = createServer(connector);
+
+      const response = await request(app)
+        .post("/oauth/validate")
+        .send(requestBody());
+
+      expect(response.status).toBe(400);
+    });
+  });
+
+  describe("POST /oauth/credential-ready", () => {
+    it("refreshes and returns a changed connector manifest", async () => {
+      const connector = new MockConnector();
+      const credentialReady = vi
+        .spyOn(connector, "oauthCredentialReady")
+        .mockResolvedValue(true);
+      const app = createServer(connector);
+
+      const response = await request(app).post("/oauth/credential-ready").send({
+        source_id: "source-456",
+        user_id: "user-123",
+        provider: "windshift",
+        flow: "user_write",
+        credentials: { access_token: "token" },
+      });
+
+      expect(response.status).toBe(200);
+      expect(response.body.connector_id).toBe("mock-connector");
+      expect(credentialReady).toHaveBeenCalledWith({
+        source_id: "source-456",
+        user_id: "user-123",
+        provider: "windshift",
+        flow: "user_write",
+        credentials: { access_token: "token" },
+      });
+    });
+  });
+
+  describe("POST /sync", () => {
+    it("returns 400 for invalid request body", async () => {
+      const connector = new MockConnector();
+      const app = createServer(connector);
+
+      const response = await request(app)
+        .post("/sync")
+        .send({ invalid: "data" });
+
+      expect(response.status).toBe(400);
+      expect(response.body.status).toBe("error");
+    });
+
+    it("fetches config from API and returns started", async () => {
+      const connector = new MockConnector();
+      const app = createServer(connector);
+
+      const response = await request(app).post("/sync").send({
+        sync_run_id: "sync-123",
+        source_id: "source-456",
+        sync_mode: "full",
+      });
+
+      expect(response.status).toBe(200);
+      expect(response.body.status).toBe("started");
+    });
+
+    it("allows realtime and scheduled syncs to run concurrently", async () => {
+      const connector = new MockConnector();
+      connector.syncModes = ["full", "incremental", "realtime"];
+      let syncCalls = 0;
+      let firstSyncStarted!: () => void;
+      const firstSyncStartedPromise = new Promise<void>((resolve) => {
+        firstSyncStarted = resolve;
+      });
+      let releaseFirstSync!: () => void;
+      const releaseFirstSyncPromise = new Promise<void>((resolve) => {
+        releaseFirstSync = resolve;
+      });
+
+      connector.syncFn = async () => {
+        syncCalls += 1;
+        if (syncCalls === 1) {
+          firstSyncStarted();
+          await releaseFirstSyncPromise;
+        }
+      };
+      const app = createServer(connector);
+
+      const scheduled = await request(app).post("/sync").send({
+        sync_run_id: "scheduled-sync",
+        source_id: "source-same",
+        sync_mode: "full",
+      });
+      expect(scheduled.status).toBe(200);
+      await firstSyncStartedPromise;
+
+      const realtime = await request(app).post("/sync").send({
+        sync_run_id: "realtime-sync",
+        source_id: "source-same",
+        sync_mode: "realtime",
+      });
+      expect(realtime.status).toBe(200);
+
+      const scheduledConflict = await request(app).post("/sync").send({
+        sync_run_id: "second-scheduled-sync",
+        source_id: "source-same",
+        sync_mode: "incremental",
+      });
+      expect(scheduledConflict.status).toBe(409);
+
+      releaseFirstSync();
+    });
+
+    it("plumbs user_filter_mode/whitelist into SyncContext.shouldIndexUser", async () => {
+      let recorded: {
+        alice: boolean;
+        bob: boolean;
+        sourceType: string | null;
+      } | null = null;
+
+      const connector = new MockConnector();
+      connector.syncFn = async (ctx) => {
+        recorded = {
+          alice: ctx.shouldIndexUser("alice@example.com"),
+          bob: ctx.shouldIndexUser("bob@example.com"),
+          sourceType: ctx.sourceType,
+        };
+      };
+      const app = createServer(connector);
+
+      // Override the default sync-config handler with a payload that
+      // pins user_filter_mode=whitelist and only admits alice.
+      mockServer.use(
+        http.get(`${MANAGER_URL}/sdk/source/source-filter/sync-config`, () =>
+          HttpResponse.json({
+            config: {},
+            credentials: {},
+            connector_state: null,
+            source_type: "linear",
+            user_filter_mode: "whitelist",
+            user_whitelist: ["alice@example.com"],
+            user_blacklist: null,
+          }),
+        ),
+      );
+
+      const response = await request(app).post("/sync").send({
+        sync_run_id: "sync-filter",
+        source_id: "source-filter",
+        sync_mode: "incremental",
+      });
+
+      expect(response.status).toBe(200);
+
+      // sync runs in the background; poll briefly for completion.
+      for (let i = 0; i < 50; i++) {
+        if (recorded !== null) break;
+        await new Promise((r) => setTimeout(r, 10));
+      }
+
+      expect(recorded).toEqual({
+        alice: true,
+        bob: false,
+        sourceType: "linear",
+      });
+    });
+  });
+
+  describe("GET /sync/:syncRunId", () => {
+    it("returns running=false for unknown sync", async () => {
+      const connector = new MockConnector();
+      const app = createServer(connector);
+
+      const response = await request(app).get("/sync/unknown-sync");
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({ running: false });
+    });
+  });
+
+  describe("POST /cancel", () => {
+    it("releases the source slot even when the old task does not exit", async () => {
+      const connector = new MockConnector();
+      const app = createServer(connector);
+      let syncCalls = 0;
+      let firstSyncStarted!: () => void;
+      const firstSyncStartedPromise = new Promise<void>((resolve) => {
+        firstSyncStarted = resolve;
+      });
+      const releaseOldSync = new Promise<void>(() => undefined);
+
+      connector.syncFn = async () => {
+        syncCalls += 1;
+        if (syncCalls === 1) {
+          firstSyncStarted();
+          await releaseOldSync;
+        }
+      };
+
+      const first = await request(app).post("/sync").send({
+        sync_run_id: "stuck-sync",
+        source_id: "src-stuck",
+        sync_mode: "full",
+      });
+      expect(first.status).toBe(200);
+      await firstSyncStartedPromise;
+
+      const conflict = await request(app).post("/sync").send({
+        sync_run_id: "conflicting-sync",
+        source_id: "src-stuck",
+        sync_mode: "full",
+      });
+      expect(conflict.status).toBe(409);
+
+      const cancel = await request(app)
+        .post("/cancel")
+        .send({ sync_run_id: "stuck-sync" });
+      expect(cancel.status).toBe(200);
+      expect(cancel.body).toEqual({ status: "cancelled" });
+
+      const status = await request(app).get("/sync/stuck-sync");
+      expect(status.body).toEqual({ running: false });
+
+      const afterCancel = await request(app).post("/sync").send({
+        sync_run_id: "after-cancel",
+        source_id: "src-stuck",
+        sync_mode: "full",
+      });
+      expect(afterCancel.status).toBe(200);
+      expect(syncCalls).toBe(2);
+    });
+
+    it("returns not_found for unknown sync", async () => {
+      const connector = new MockConnector();
+      const app = createServer(connector);
+
+      const response = await request(app)
+        .post("/cancel")
+        .send({ sync_run_id: "unknown-sync" });
+
+      expect(response.status).toBe(404);
+      expect(response.body).toEqual({ status: "not_found" });
+    });
+
+    it("returns 400 for invalid request body", async () => {
+      const connector = new MockConnector();
+      const app = createServer(connector);
+
+      const response = await request(app)
+        .post("/cancel")
+        .send({ invalid: "data" });
+
+      expect(response.status).toBe(400);
+    });
+  });
+
+  describe("POST /action", () => {
+    it("passes params and source/actor_email separately", async () => {
+      let capturedParams: Record<string, unknown> = {};
+      let capturedSource: unknown = null;
+      let capturedActorEmail: unknown = null;
+      class TrustedActionConnector extends MockConnector {
+        async executeAction(
+          _action: string,
+          params: Record<string, unknown>,
+          _credentials: Record<string, unknown>,
+          source?: unknown,
+          actor_email?: unknown,
+        ): Promise<Response> {
+          capturedParams = params;
+          capturedSource = source;
+          capturedActorEmail = actor_email;
+          return ActionResponse.success({ ok: true }).toResponse();
+        }
+      }
+      const app = createServer(new TrustedActionConnector());
+      const testSource = {
+        id: "src-123",
+        name: "Test Source",
+        source_type: "test",
+        config: { base_url: "https://trusted.example" },
+      };
+      const response = await request(app)
+        .post("/action")
+        .send({
+          action: "safe",
+          params: { some_key: "user_value" },
+          credentials: {},
+          source: testSource,
+          actor_email: "a@b.com",
+        });
+      expect(response.status).toBe(200);
+      expect(capturedParams).toEqual({ some_key: "user_value" });
+      expect(capturedSource).toEqual(testSource);
+      expect(capturedActorEmail).toEqual("a@b.com");
+    });
+
+    it("returns not supported for unknown action", async () => {
+      const connector = new MockConnector();
+      const app = createServer(connector);
+
+      const response = await request(app).post("/action").send({
+        action: "unknown_action",
+        params: {},
+        credentials: {},
+      });
+
+      expect(response.status).toBe(404);
+      expect(response.body).toEqual({
+        status: "error",
+        error: "Action not supported: unknown_action",
+      });
+    });
+
+    it("returns 400 for invalid request body", async () => {
+      const connector = new MockConnector();
+      const app = createServer(connector);
+
+      const response = await request(app)
+        .post("/action")
+        .send({ invalid: "data" });
+
+      expect(response.status).toBe(400);
+    });
+
+    it("returns binary response for binary action result", async () => {
+      class BinaryActionConnector extends MockConnector {
+        name = "binary-action-connector";
+        async executeAction(
+          action: string,
+          _params: Record<string, unknown>,
+          _credentials: Record<string, unknown>,
+        ): Promise<Response> {
+          if (action === "download") {
+            return new Response(Buffer.from("binary data"), {
+              status: 200,
+              headers: { "Content-Type": "application/octet-stream" },
+            });
+          }
+          return ActionResponse.notSupported(action).toResponse(404);
+        }
+      }
+
+      const connector = new BinaryActionConnector();
+      const app = createServer(connector);
+
+      const response = await request(app).post("/action").send({
+        action: "download",
+        params: {},
+        credentials: {},
+      });
+
+      expect(response.status).toBe(200);
+      expect(response.headers["content-type"]).toBe("application/octet-stream");
+      expect(response.body).toBeInstanceOf(Buffer);
+      expect((response.body as Buffer).toString()).toBe("binary data");
+    });
+  });
+
+
+});

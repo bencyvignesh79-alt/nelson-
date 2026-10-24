@@ -1,0 +1,143 @@
+pub mod mock_connector;
+
+use anyhow::Result;
+use mock_connector::MockConnector;
+use omni_connector_manager::{
+    AppState, config::ConnectorManagerConfig, create_app, remote_mcp::gateway::RemoteMcpGateway,
+    sync_manager::SyncManager,
+};
+use redis::{AsyncCommands, Client as RedisClient};
+use shared::ObjectStorage;
+use shared::models::{ConnectorManifest, IntegrationType, SourceType, SyncType};
+use shared::storage::postgres::PostgresStorage;
+use shared::test_environment::TestEnvironment;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
+
+pub const TEST_SOURCE_ID: &str = "01JGF7V3E0Y2R1X8P5Q7W9T4N7";
+
+pub struct TestFixture {
+    pub state: AppState,
+    pub app: axum::Router,
+    pub mock_connector: MockConnector,
+    #[allow(dead_code)]
+    test_env: TestEnvironment,
+}
+
+impl TestFixture {
+    pub fn indexer_state(&self) -> omni_indexer::AppState {
+        omni_indexer::AppState {
+            db_pool: self.state.db_pool.clone(),
+            redis_client: self.state.redis_client.clone(),
+            ai_client: shared::AIClient::new(self.test_env.mock_ai_server.base_url.clone()),
+            content_storage: self.state.content_storage.clone(),
+            embedding_queue: shared::embedding_queue::EmbeddingQueue::new(
+                self.state.db_pool.pool().clone(),
+            ),
+        }
+    }
+}
+
+pub async fn setup_test_fixture() -> Result<TestFixture> {
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe {
+        std::env::set_var(
+            "ENCRYPTION_KEY",
+            "test_master_key_that_is_long_enough_32_chars",
+        )
+    };
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("ENCRYPTION_SALT", "test_salt_16_chars") };
+
+    let test_env = TestEnvironment::new().await?;
+    let mock_connector = MockConnector::start().await?;
+
+    let config = ConnectorManagerConfig {
+        database: test_env.database_config(),
+        redis: test_env.redis_config(),
+        port: 0,
+        max_concurrent_syncs: 2,
+        max_concurrent_syncs_per_type: 3,
+        scheduler_interval_seconds: 600,
+        stale_sync_timeout_minutes: 1,
+        extraction_concurrency: 2,
+        extraction_retry_after_seconds: 30,
+        sync_backoff_base_seconds: 30,
+        sync_backoff_max_seconds: 3600,
+        sync_max_consecutive_failures: 10,
+    };
+
+    let redis_client = RedisClient::open(config.redis.redis_url.clone())?;
+
+    // Register mock connector manifests in Redis so the manager can find them
+    let mut redis_conn = redis_client.get_multiplexed_async_connection().await?;
+    for (source_type, connector_id) in [
+        (SourceType::LocalFiles.to_string(), "filesystem"),
+        ("darwinbox".to_string(), "darwinbox"),
+    ] {
+        let manifest = ConnectorManifest {
+            name: connector_id.to_string(),
+            display_name: connector_id.to_string(),
+            version: "1.0.0".to_string(),
+            sync_modes: vec![SyncType::Full],
+            connector_id: connector_id.to_string(),
+            connector_url: mock_connector.base_url.clone(),
+            integration_type: IntegrationType::Connector,
+            source_types: vec![source_type],
+            description: None,
+            actions: vec![],
+            search_operators: vec![],
+            read_only: false,
+            extra_schema: None,
+            attributes_schema: None,
+            mcp_enabled: false,
+            mcp_catalog_loaded: false,
+            prompts: vec![],
+            skills: vec![],
+            source_capabilities: vec![],
+            resources: vec![],
+            oauth: None,
+        };
+        let manifest_json = serde_json::to_string(&manifest)?;
+        let _: () = redis_conn
+            .set_ex(
+                format!("connector:manifest:{}", connector_id),
+                &manifest_json,
+                600,
+            )
+            .await?;
+    }
+
+    let content_storage: Arc<dyn ObjectStorage> =
+        Arc::new(PostgresStorage::new(test_env.db_pool.pool().clone()));
+
+    let sync_manager = Arc::new(SyncManager::new(
+        &test_env.db_pool,
+        config.clone(),
+        redis_client.clone(),
+    ));
+
+    let remote_mcp_gateway = Arc::new(RemoteMcpGateway::new(
+        test_env.db_pool.clone(),
+        redis_client.clone(),
+    )?);
+
+    let app_state = AppState {
+        db_pool: test_env.db_pool.clone(),
+        redis_client,
+        extraction_semaphore: Arc::new(Semaphore::new(config.extraction_concurrency)),
+        config,
+        sync_manager,
+        remote_mcp_gateway,
+        content_storage,
+    };
+
+    let app = create_app(app_state.clone());
+
+    Ok(TestFixture {
+        state: app_state,
+        app,
+        mock_connector,
+        test_env,
+    })
+}

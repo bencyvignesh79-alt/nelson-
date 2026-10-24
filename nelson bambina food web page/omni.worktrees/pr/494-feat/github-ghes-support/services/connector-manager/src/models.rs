@@ -1,0 +1,333 @@
+use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
+use shared::models::{Source, SourceType, SyncRun, SyncType};
+use time::OffsetDateTime;
+
+pub use shared::models::{
+    ActionDefinition, ActionOrigin, ActionRequest, ActionResponse, CancelRequest,
+    ConnectorManifest, McpCredentials, McpPromptDefinition, McpResourceDefinition,
+    OAuthCredentialFlow, OAuthCredentialValidationRequest, OAuthCredentialValidationResponse,
+    OAuthSourceBinding, PromptRequest, ResourceRequest, SearchOperator, SkillRequest,
+    SkillResponse, SyncRequest, SyncResponse, SyncStatusResponse,
+};
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerType {
+    Scheduled,
+    Manual,
+    Webhook,
+}
+
+impl std::fmt::Display for TriggerType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TriggerType::Scheduled => write!(f, "scheduled"),
+            TriggerType::Manual => write!(f, "manual"),
+            TriggerType::Webhook => write!(f, "webhook"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncProgress {
+    pub sync_run_id: String,
+    pub source_id: String,
+    pub status: String,
+    pub documents_scanned: i32,
+    pub documents_processed: i32,
+    pub documents_updated: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleInfo {
+    pub source_id: String,
+    pub source_name: String,
+    pub source_type: String,
+    pub sync_interval_seconds: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_sync_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_sync_at: Option<String>,
+    pub sync_status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestSourceContext {
+    pub id: String,
+    pub source_type: String,
+    pub config: JsonValue,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+impl ManifestSourceContext {
+    pub fn from_source(source: &Source, config: JsonValue) -> Self {
+        Self {
+            id: source.id.clone(),
+            source_type: source.source_type.clone(),
+            config,
+            updated_at: source.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectorInfo {
+    pub source_type: String,
+    pub url: String,
+    /// Omitted by metadata listings; live reachability is not checked on this endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub healthy: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<ConnectorManifest>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceHealth {
+    Healthy,
+    Unhealthy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceSyncOverview {
+    pub source: Source,
+    pub health: SourceHealth,
+    pub sync_runs: Vec<SyncRun>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TriggerSyncRequest {
+    pub source_id: String,
+    #[serde(default)]
+    pub sync_mode: Option<SyncType>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TriggerSyncResponse {
+    pub sync_run_id: String,
+    pub status: String,
+}
+
+/// Transient credentials accepted during setup/discovery before a source or
+/// credential row exists in the database. Used by the setup UI to discover
+/// connector capabilities (e.g. list shared drives) with an inline credential
+/// that has not yet been persisted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransientCredentials {
+    pub provider: shared::models::ServiceProvider,
+    pub auth_type: shared::models::AuthType,
+    pub principal_email: Option<String>,
+    pub credentials: JsonValue,
+    #[serde(default)]
+    pub config: JsonValue,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecuteActionRequest {
+    /// Source ID, required when persisted credentials should be resolved.
+    #[serde(default)]
+    pub source_id: Option<String>,
+    /// Acting user. `None` for org-level / system-initiated calls (sync,
+    /// future org-level agents); `Some` for chat tool dispatch and other
+    /// user-context invocations.
+    #[serde(default)]
+    pub user_id: Option<String>,
+    pub action: String,
+    #[serde(default)]
+    pub params: JsonValue,
+    /// Source type hint, required when `transient_credentials` are provided.
+    #[serde(default)]
+    pub source_type: Option<SourceType>,
+    /// Inline credentials for setup/discovery actions. When present, the request
+    /// is handled in **transient mode**: `source_id` and DB credentials are
+    /// not used, and `source_type` must identify the connector.
+    #[serde(default)]
+    pub transient_credentials: Option<TransientCredentials>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthCredentialReadyRequest {
+    pub source_id: String,
+    #[serde(default)]
+    pub user_id: Option<String>,
+    pub provider: String,
+    pub flow: String,
+    /// Resolved credential payload forwarded to the connector. Web callers omit
+    /// this; connector-manager fills it after resolving stored credentials.
+    #[serde(default)]
+    pub credentials: JsonValue,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SdkSourceSyncConfigResponse {
+    pub config: JsonValue,
+    pub credentials: JsonValue,
+    pub connector_state: Option<JsonValue>,
+    pub checkpoint: Option<JsonValue>,
+    pub source_type: SourceType,
+    pub user_filter_mode: shared::models::UserFilterMode,
+    pub user_whitelist: Option<JsonValue>,
+    pub user_blacklist: Option<JsonValue>,
+}
+
+// ============================================================================
+// SDK Models - Used by connectors to communicate with connector-manager
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SdkEmitEventRequest {
+    pub sync_run_id: String,
+    pub source_id: String,
+    pub event: shared::models::ConnectorEvent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SdkEmitBatchRequest {
+    pub sync_run_id: String,
+    pub source_id: String,
+    pub events: Vec<shared::models::ConnectorEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SdkStoreContentRequest {
+    pub sync_run_id: String,
+    pub content: String,
+    #[serde(default)]
+    pub content_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SdkStoreContentResponse {
+    pub content_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SdkFailRequest {
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SdkIncrementScannedRequest {
+    #[serde(default = "default_count")]
+    pub count: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SdkIncrementUpdatedRequest {
+    #[serde(default = "default_count")]
+    pub count: i32,
+}
+
+fn default_count() -> i32 {
+    1
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SdkStatusResponse {
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SdkCreateSyncRequest {
+    pub source_id: String,
+    pub sync_type: shared::models::SyncType,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SdkCreateSyncResponse {
+    pub sync_run_id: String,
+}
+
+// ============================================================================
+// SDK Extract Content
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SdkExtractContentResponse {
+    pub content_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SdkExtractTextResponse {
+    pub text: String,
+}
+
+// ============================================================================
+// SDK Cancel Sync
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SdkCancelSyncRequest {
+    pub sync_run_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SdkCancelSyncResponse {
+    pub success: bool,
+}
+
+// ============================================================================
+// SDK User Email
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SdkUserEmailResponse {
+    pub email: String,
+}
+
+// ============================================================================
+// SDK Webhook Notification
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SdkWebhookNotification {
+    pub source_id: String,
+    pub event_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SdkWebhookResponse {
+    pub sync_run_id: String,
+}
+
+// ============================================================================
+// MCP Resource & Prompt forwarding
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecuteResourceRequest {
+    pub source_id: String,
+    #[serde(default)]
+    pub user_id: Option<String>,
+    pub uri: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutePromptRequest {
+    pub source_id: String,
+    #[serde(default)]
+    pub user_id: Option<String>,
+    pub name: String,
+    #[serde(default)]
+    pub arguments: Option<JsonValue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecuteSkillRequest {
+    pub skill_id: String,
+    #[serde(default)]
+    pub source_id: Option<String>,
+    #[serde(default)]
+    pub user_id: Option<String>,
+    #[serde(default)]
+    pub arguments: Option<JsonValue>,
+}

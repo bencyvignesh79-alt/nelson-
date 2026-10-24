@@ -1,0 +1,92 @@
+export { Connector, type ServeOptions } from './connector.js';
+export { SyncContext } from './context.js';
+export { ContentStorage } from './storage.js';
+export { SdkClient } from './client.js';
+// McpAdapter (the runtime class) is not re-exported here to avoid requiring
+// @modelcontextprotocol/sdk as a mandatory dependency. Import directly from
+// './mcp-adapter.js' when needed. Type-only exports for the server config
+// types are safe to surface here since they have no runtime cost.
+export type {
+  HttpMcpServer,
+  McpAdapter,
+  McpServer,
+  StdioMcpServer,
+} from './mcp-adapter.js';
+export { createServer } from './server.js';
+
+export {
+  SyncMode,
+  EventType,
+  DocumentMetadataSchema,
+  DocumentPermissionsSchema,
+  DocumentSchema,
+  ConnectorEventSchema,
+  PersonSyncRecordSchema,
+  PersonSyncEventSchema,
+  PersonDeletedEventSchema,
+  ActionCredentialScopeSchema,
+  ActionDefinitionSchema,
+  ActionOriginSchema,
+  OAuthCredentialFlowSchema,
+  OAuthCredentialValidationRequestSchema,
+  OAuthCredentialValidationResponseSchema,
+  OAuthSourceBindingSchema,
+  SearchOperatorSchema,
+  McpResourceDefinitionSchema,
+  McpPromptArgumentSchema,
+  McpPromptDefinitionSchema,
+  ConnectorSkillDefinitionSchema,
+  ConnectorManifestSchema,
+  ConnectorSourceCapabilitiesSchema,
+  SyncRequestSchema,
+  SyncResponseSchema,
+  CancelRequestSchema,
+  CancelResponseSchema,
+  ActionRequestSchema,
+  ActionResponseSchema,
+  createSyncResponseStarted,
+  createSyncResponseError,
+  ActionResponse,
+  serializeConnectorEvent,
+  UserFilterMode,
+  SdkSourceSyncDataSchema,
+  type DocumentMetadata,
+  type DocumentPermissions,
+  type Document,
+  type ConnectorEvent,
+  type PersonSyncRecord,
+  type PersonSyncEvent,
+  type PersonSyncEventPayload,
+  type PersonDeletedEvent,
+  type PersonDeletedEventPayload,
+  type ActionCredentialScope,
+  type ActionOrigin,
+  type ActionDefinition,
+  type OAuthCredentialFlow,
+  type OAuthCredentialValidationRequest,
+  type OAuthCredentialValidationResponse,
+  type OAuthSourceBinding,
+  type SearchOperator,
+  type McpResourceDefinition,
+  type McpPromptArgument,
+  type McpPromptDefinition,
+  type ConnectorSkillDefinition,
+  type ConnectorManifest,
+  type ConnectorSourceCapabilities,
+  type SyncRequest,
+  type SyncResponse,
+  type CancelRequest,
+  type CancelResponse,
+  type ActionRequest,
+  type ConnectorEventPayload,
+  type SdkSourceSyncData,
+} from './models.js';
+
+export {
+  ConnectorError,
+  SdkClientError,
+  SyncCancelledError,
+  ConfigurationError,
+} from './errors.js';
+
+export { getLogger } from './logger.js';

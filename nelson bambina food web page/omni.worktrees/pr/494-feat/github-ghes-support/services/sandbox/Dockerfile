@@ -1,0 +1,81 @@
+FROM lukemathwalker/cargo-chef:latest-rust-1.91.1-bookworm AS chef
+WORKDIR /app
+
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+ARG BUILD_MODE=release
+COPY --from=planner /app/recipe.json recipe.json
+
+RUN if [ "$BUILD_MODE" = "debug" ]; then \
+        cargo chef cook --recipe-path recipe.json; \
+    else \
+        cargo chef cook --release --recipe-path recipe.json; \
+    fi
+
+COPY Cargo.toml Cargo.lock ./
+COPY shared/ shared/
+COPY services/sandbox/ services/sandbox/
+
+RUN if [ "$BUILD_MODE" = "debug" ]; then \
+        cargo build --bin omni-sandbox --bin sandbox-exec; \
+    else \
+        cargo build --release --bin omni-sandbox --bin sandbox-exec; \
+    fi
+
+FROM python:3.12-slim-bookworm AS runtime
+ARG BUILD_MODE=release
+
+# Install curl for healthcheck, git for per-chat file versioning, and common
+# data processing libraries for user code
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl git nodejs npm && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV MPLBACKEND=Agg
+
+RUN pip install --no-cache-dir \
+    pandas>=2.2.0 \
+    numpy>=1.26.0 \
+    openpyxl>=3.1.0 \
+    xlsxwriter>=3.2.0 \
+    matplotlib>=3.9.0 \
+    seaborn>=0.13.0 \
+    python-docx>=1.1.0 \
+    python-pptx>=1.0.0 \
+    reportlab>=4.2.0 \
+    pypdf>=5.0.0
+
+COPY services/sandbox/scripts/excel /usr/local/bin/excel
+RUN chmod +x /usr/local/bin/excel
+
+# The component SDK is immutable at runtime. The lockfile and fixed Vite
+# configuration are kept outside each writable chat workspace.
+COPY services/sandbox/component-sdk /opt/omni/component-sdk
+RUN cd /opt/omni/component-sdk && npm ci --omit=dev --ignore-scripts --no-audit --no-fund && \
+    npm pack --silent @tailwindcss/oxide-linux-x64-gnu@4.3.2 && \
+    mkdir -p node_modules/@tailwindcss/oxide-linux-x64-gnu && \
+    tar -xzf tailwindcss-oxide-linux-x64-gnu-4.3.2.tgz --strip-components=1 -C node_modules/@tailwindcss/oxide-linux-x64-gnu && \
+    rm tailwindcss-oxide-linux-x64-gnu-4.3.2.tgz && \
+    npm cache clean --force && \
+    chmod 0555 /opt/omni/component-sdk/build.mjs
+COPY services/sandbox/scripts/omni-component-build /usr/local/bin/omni-component-build
+RUN chmod 0555 /usr/local/bin/omni-component-build
+
+# Run as non-root user
+RUN useradd -m sandbox
+
+# Create scratch directory owned by sandbox user
+RUN mkdir -p /scratch && chown sandbox:sandbox /scratch
+
+WORKDIR /app
+COPY --from=builder /app/target/${BUILD_MODE}/omni-sandbox /usr/local/bin/omni-sandbox
+COPY --from=builder /app/target/${BUILD_MODE}/sandbox-exec /usr/local/bin/sandbox-exec
+
+USER sandbox
+
+EXPOSE 8090
+
+CMD ["omni-sandbox"]

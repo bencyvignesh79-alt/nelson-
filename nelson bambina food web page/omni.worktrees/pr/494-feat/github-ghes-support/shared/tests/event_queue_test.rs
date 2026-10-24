@@ -1,0 +1,949 @@
+#[cfg(test)]
+mod tests {
+    use shared::models::{
+        ConnectorEvent, DocumentMetadata, DocumentPermissions, EventStatus, SyncType,
+    };
+    use shared::queue::EventQueue;
+    use shared::test_environment::TestEnvironment;
+
+    const TEST_SOURCE_ID: &str = "01JGF7V3E0Y2R1X8P5Q7W9T4N7";
+
+    fn make_event(sync_run_id: &str, doc_id: &str) -> ConnectorEvent {
+        ConnectorEvent::DocumentCreated {
+            sync_run_id: sync_run_id.to_string(),
+            source_id: TEST_SOURCE_ID.to_string(),
+            document_id: doc_id.to_string(),
+            content_id: "content-1".to_string(),
+            metadata: DocumentMetadata::default(),
+            permissions: DocumentPermissions {
+                public: false,
+                users: vec!["user1".to_string()],
+                groups: vec![],
+            },
+            attributes: None,
+        }
+    }
+
+    fn make_event_with_content(
+        sync_run_id: &str,
+        doc_id: &str,
+        content_id: String,
+    ) -> ConnectorEvent {
+        ConnectorEvent::DocumentCreated {
+            sync_run_id: sync_run_id.to_string(),
+            source_id: TEST_SOURCE_ID.to_string(),
+            document_id: doc_id.to_string(),
+            content_id,
+            metadata: DocumentMetadata::default(),
+            permissions: DocumentPermissions {
+                public: false,
+                users: vec!["user1".to_string()],
+                groups: vec![],
+            },
+            attributes: None,
+        }
+    }
+
+    async fn insert_sized_content(pool: &sqlx::PgPool, size_bytes: i64) -> String {
+        let content_id = ulid::Ulid::new().to_string();
+        sqlx::query(
+            r#"
+            INSERT INTO content_blobs (id, content, size_bytes, storage_backend)
+            VALUES ($1, $2, $3, 'postgres')
+            "#,
+        )
+        .bind(&content_id)
+        .bind(Vec::<u8>::new())
+        .bind(size_bytes)
+        .execute(pool)
+        .await
+        .unwrap();
+        content_id
+    }
+
+    async fn insert_sync_run(pool: &sqlx::PgPool, run_id: &str, sync_type: &str) {
+        sqlx::query(
+            r#"
+            INSERT INTO sync_runs (id, source_id, sync_type, status, started_at, completed_at, created_at, updated_at)
+            VALUES ($1, $2, $3, 'completed', NOW(), NOW(), NOW(), NOW())
+            "#,
+        )
+        .bind(run_id)
+        .bind(TEST_SOURCE_ID)
+        .bind(sync_type)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_and_dequeue_lifecycle() {
+        let env = TestEnvironment::new().await.unwrap();
+        let queue = EventQueue::new(env.db_pool.pool().clone());
+
+        let event = make_event("run-1", "doc-1");
+        let event_id = queue.enqueue(TEST_SOURCE_ID, &event).await.unwrap();
+        assert!(!event_id.is_empty());
+
+        let batch = queue.dequeue_batch(10).await.unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].id, event_id);
+        assert_eq!(batch[0].event_type, "document_created");
+        assert!(matches!(batch[0].status, EventStatus::Processing));
+
+        // Dequeuing again should return empty (already processing)
+        let batch2 = queue.dequeue_batch(10).await.unwrap();
+        assert!(batch2.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_dequeue_batch_drains_oldest_pending_events() {
+        let env = TestEnvironment::new().await.unwrap();
+        let queue = EventQueue::new(env.db_pool.pool().clone());
+
+        let run_a = ulid::Ulid::new().to_string();
+        let run_b = ulid::Ulid::new().to_string();
+
+        // Enqueue 3 events for run_a and 1 for run_b
+        for i in 0..3 {
+            let event = make_event(&run_a, &format!("doc-a{}", i));
+            queue.enqueue(TEST_SOURCE_ID, &event).await.unwrap();
+        }
+        let event_b = make_event(&run_b, "doc-b1");
+        queue.enqueue(TEST_SOURCE_ID, &event_b).await.unwrap();
+
+        // Dequeue drains the oldest pending events across sync runs. The
+        // indexer groups them by sync_run_id after dequeueing.
+        let batch = queue.dequeue_batch(10).await.unwrap();
+        assert_eq!(batch.len(), 4);
+        assert_eq!(
+            batch
+                .iter()
+                .filter(|item| item.sync_run_id == run_a)
+                .count(),
+            3
+        );
+        assert_eq!(
+            batch
+                .iter()
+                .filter(|item| item.sync_run_id == run_b)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mark_completed() {
+        let env = TestEnvironment::new().await.unwrap();
+        let queue = EventQueue::new(env.db_pool.pool().clone());
+
+        let event = make_event("run-1", "doc-1");
+        let event_id = queue.enqueue(TEST_SOURCE_ID, &event).await.unwrap();
+
+        let batch = queue.dequeue_batch(10).await.unwrap();
+        assert_eq!(batch.len(), 1);
+
+        queue.mark_completed(&event_id).await.unwrap();
+
+        let stats = queue.get_queue_stats().await.unwrap();
+        assert_eq!(stats.completed, 1);
+        assert_eq!(stats.pending, 0);
+        assert_eq!(stats.processing, 0);
+    }
+
+    #[tokio::test]
+    async fn test_mark_failed_increments_retry_count() {
+        let env = TestEnvironment::new().await.unwrap();
+        let queue = EventQueue::new(env.db_pool.pool().clone());
+
+        let event = make_event("run-1", "doc-1");
+        let event_id = queue.enqueue(TEST_SOURCE_ID, &event).await.unwrap();
+
+        queue.dequeue_batch(10).await.unwrap();
+
+        queue.mark_failed(&event_id, "timeout error").await.unwrap();
+
+        let stats = queue.get_queue_stats().await.unwrap();
+        assert_eq!(stats.failed, 1);
+    }
+
+    #[tokio::test]
+    async fn test_dead_letter_after_max_retries() {
+        let env = TestEnvironment::new().await.unwrap();
+        let queue = EventQueue::new(env.db_pool.pool().clone());
+
+        let event = make_event("run-1", "doc-1");
+        let event_id = queue.enqueue(TEST_SOURCE_ID, &event).await.unwrap();
+
+        // Dequeue and fail 3 times (default max_retries = 3)
+        queue.dequeue_batch(10).await.unwrap();
+        queue.mark_failed(&event_id, "error 1").await.unwrap();
+
+        queue.retry_failed_events().await.unwrap();
+        queue.dequeue_batch(10).await.unwrap();
+        queue.mark_failed(&event_id, "error 2").await.unwrap();
+
+        queue.retry_failed_events().await.unwrap();
+        queue.dequeue_batch(10).await.unwrap();
+        queue.mark_failed(&event_id, "error 3").await.unwrap();
+
+        // After 3 failures (retry_count=3 >= max_retries=3), should be dead_letter
+        let stats = queue.get_queue_stats().await.unwrap();
+        assert_eq!(stats.dead_letter, 1);
+        assert_eq!(stats.failed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_retry_failed_events() {
+        let env = TestEnvironment::new().await.unwrap();
+        let queue = EventQueue::new(env.db_pool.pool().clone());
+
+        let event = make_event("run-1", "doc-1");
+        let event_id = queue.enqueue(TEST_SOURCE_ID, &event).await.unwrap();
+
+        queue.dequeue_batch(10).await.unwrap();
+        queue
+            .mark_failed(&event_id, "transient error")
+            .await
+            .unwrap();
+
+        let retried = queue.retry_failed_events().await.unwrap();
+        assert_eq!(retried, 1);
+
+        // Should now be dequeue-able again
+        let batch = queue.dequeue_batch(10).await.unwrap();
+        assert_eq!(batch.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_recover_stale_processing_items() {
+        let env = TestEnvironment::new().await.unwrap();
+        let queue = EventQueue::new(env.db_pool.pool().clone());
+
+        let event = make_event("run-1", "doc-1");
+        queue.enqueue(TEST_SOURCE_ID, &event).await.unwrap();
+
+        queue.dequeue_batch(10).await.unwrap();
+
+        // timeout=0 means all processing items are considered stale
+        let recovered = queue.recover_stale_processing_items(0).await.unwrap();
+        assert_eq!(recovered, 1);
+
+        let batch = queue.dequeue_batch(10).await.unwrap();
+        assert_eq!(batch.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_batch_mark_completed() {
+        let env = TestEnvironment::new().await.unwrap();
+        let queue = EventQueue::new(env.db_pool.pool().clone());
+
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let event = make_event("run-1", &format!("doc-{}", i));
+            let id = queue.enqueue(TEST_SOURCE_ID, &event).await.unwrap();
+            ids.push(id);
+        }
+
+        queue.dequeue_batch(10).await.unwrap();
+
+        let completed = queue.mark_events_completed_batch(ids).await.unwrap();
+        assert_eq!(completed, 3);
+
+        let stats = queue.get_queue_stats().await.unwrap();
+        assert_eq!(stats.completed, 3);
+    }
+
+    #[tokio::test]
+    async fn test_batch_mark_failed() {
+        let env = TestEnvironment::new().await.unwrap();
+        let queue = EventQueue::new(env.db_pool.pool().clone());
+
+        let mut ids = Vec::new();
+        for i in 0..2 {
+            let event = make_event("run-1", &format!("doc-{}", i));
+            let id = queue.enqueue(TEST_SOURCE_ID, &event).await.unwrap();
+            ids.push(id);
+        }
+
+        queue.dequeue_batch(10).await.unwrap();
+
+        let errors: Vec<(String, String)> = ids
+            .into_iter()
+            .map(|id| (id, "batch error".to_string()))
+            .collect();
+
+        let failed = queue.mark_events_failed_batch(errors).await.unwrap();
+        assert_eq!(failed, 2);
+
+        let stats = queue.get_queue_stats().await.unwrap();
+        assert_eq!(stats.failed, 2);
+    }
+
+    #[tokio::test]
+    async fn test_batch_dead_letter_uses_incremented_retry_count() {
+        let env = TestEnvironment::new().await.unwrap();
+        let pool = env.db_pool.pool().clone();
+        let queue = EventQueue::new(pool.clone());
+
+        let near_limit_event = make_event("run-1", "doc-near-limit");
+        let below_limit_event = make_event("run-1", "doc-below-limit");
+        let near_limit_id = queue
+            .enqueue(TEST_SOURCE_ID, &near_limit_event)
+            .await
+            .unwrap();
+        let below_limit_id = queue
+            .enqueue(TEST_SOURCE_ID, &below_limit_event)
+            .await
+            .unwrap();
+
+        queue.dequeue_batch(10).await.unwrap();
+
+        sqlx::query("UPDATE connector_events_queue SET retry_count = $1 WHERE id = $2")
+            .bind(2)
+            .bind(&near_limit_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE connector_events_queue SET retry_count = $1 WHERE id = $2")
+            .bind(1)
+            .bind(&below_limit_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let updated = queue
+            .mark_events_dead_letter_batch(vec![
+                (near_limit_id.clone(), "near limit".to_string()),
+                (below_limit_id.clone(), "below limit".to_string()),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(updated, 2);
+
+        let near_limit_row: (String, i32) =
+            sqlx::query_as("SELECT status, retry_count FROM connector_events_queue WHERE id = $1")
+                .bind(&near_limit_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(near_limit_row, ("dead_letter".to_string(), 3));
+
+        let below_limit_row: (String, i32) =
+            sqlx::query_as("SELECT status, retry_count FROM connector_events_queue WHERE id = $1")
+                .bind(&below_limit_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(below_limit_row, ("failed".to_string(), 2));
+    }
+
+    #[tokio::test]
+    async fn test_queue_stats() {
+        let env = TestEnvironment::new().await.unwrap();
+        let queue = EventQueue::new(env.db_pool.pool().clone());
+
+        let stats = queue.get_queue_stats().await.unwrap();
+        assert_eq!(stats.pending, 0);
+        assert_eq!(stats.processing, 0);
+        assert_eq!(stats.completed, 0);
+        assert_eq!(stats.failed, 0);
+        assert_eq!(stats.dead_letter, 0);
+
+        for i in 0..3 {
+            let event = make_event("run-1", &format!("doc-{}", i));
+            queue.enqueue(TEST_SOURCE_ID, &event).await.unwrap();
+        }
+
+        let stats = queue.get_queue_stats().await.unwrap();
+        assert_eq!(stats.pending, 3);
+    }
+
+    #[tokio::test]
+    async fn test_pending_count() {
+        let env = TestEnvironment::new().await.unwrap();
+        let queue = EventQueue::new(env.db_pool.pool().clone());
+
+        assert_eq!(queue.get_pending_count().await.unwrap(), 0);
+
+        for i in 0..5 {
+            let event = make_event("run-1", &format!("doc-{}", i));
+            queue.enqueue(TEST_SOURCE_ID, &event).await.unwrap();
+        }
+
+        assert_eq!(queue.get_pending_count().await.unwrap(), 5);
+
+        queue.dequeue_batch(2).await.unwrap();
+        assert_eq!(queue.get_pending_count().await.unwrap(), 3);
+    }
+
+    /// Regression test: events whose `sync_run_id` no longer exists in
+    /// `sync_runs` (e.g. because the sync_run row was GC'd or the source
+    /// was deleted but the queue rows weren't) must be drainable via
+    /// `dequeue_batch_orphans`. Before the `FOR UPDATE OF q SKIP LOCKED`
+    /// fix, this query failed at parse time with "FOR UPDATE cannot be
+    /// applied to the nullable side of an outer join", which propagated
+    /// up through `process_batch` and starved the entire indexer.
+    #[tokio::test]
+    async fn test_dequeue_batch_orphans_drains_events_with_missing_sync_run() {
+        let env = TestEnvironment::new().await.unwrap();
+        let queue = EventQueue::new(env.db_pool.pool().clone());
+
+        // Enqueue events under sync_run_ids that have no row in sync_runs —
+        // exactly the orphan condition produced when a source is deleted
+        // and its sync_runs cascade away faster than the queue is drained.
+        for i in 0..3 {
+            let event = make_event("nonexistent-run", &format!("orphan-doc-{}", i));
+            queue.enqueue(TEST_SOURCE_ID, &event).await.unwrap();
+        }
+
+        let batch = queue.dequeue_batch_orphans(10).await.unwrap();
+        assert_eq!(batch.len(), 3);
+        for item in &batch {
+            assert!(matches!(item.status, EventStatus::Processing));
+        }
+
+        // Re-running should return empty — claimed rows are now `processing`.
+        let again = queue.dequeue_batch_orphans(10).await.unwrap();
+        assert!(again.is_empty());
+    }
+
+    // Integration coverage for EventQueue::dequeue_batch_with_max_bytes.
+    // TestEnvironment starts a real ParadeDB/Postgres testcontainer.
+    #[tokio::test]
+    async fn test_dequeue_batch_with_max_bytes_keeps_tiny_docs_count_limited() {
+        let env = TestEnvironment::new().await.unwrap();
+        let pool = env.db_pool.pool().clone();
+        let queue = EventQueue::new(pool.clone());
+
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let content_id = insert_sized_content(&pool, 1).await;
+            let event = make_event_with_content("run-1", &format!("tiny-doc-{}", i), content_id);
+            ids.push(queue.enqueue(TEST_SOURCE_ID, &event).await.unwrap());
+        }
+
+        // The byte budget includes event payload text, so calibrate it from a
+        // measured payload to stay generous enough that the count limit binds.
+        let payload: i64 = sqlx::query_scalar(
+            "SELECT octet_length(payload::text)::bigint FROM connector_events_queue WHERE id = $1",
+        )
+        .bind(&ids[0])
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let batch = queue
+            .dequeue_batch_with_max_bytes(2, payload * 2 + 1000)
+            .await
+            .unwrap();
+        assert_eq!(batch.len(), 2);
+        assert_eq!(queue.get_pending_count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_dequeue_batch_with_max_bytes_stops_at_byte_budget() {
+        let env = TestEnvironment::new().await.unwrap();
+        let pool = env.db_pool.pool().clone();
+        let queue = EventQueue::new(pool.clone());
+
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let content_id = insert_sized_content(&pool, 20).await;
+            let event = make_event_with_content("run-1", &format!("medium-doc-{}", i), content_id);
+            ids.push(queue.enqueue(TEST_SOURCE_ID, &event).await.unwrap());
+        }
+
+        // Budget admits exactly the first event once payload text is counted.
+        let payload: i64 = sqlx::query_scalar(
+            "SELECT octet_length(payload::text)::bigint FROM connector_events_queue WHERE id = $1",
+        )
+        .bind(&ids[0])
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let batch = queue
+            .dequeue_batch_with_max_bytes(10, payload + 30)
+            .await
+            .unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(queue.get_pending_count().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_dequeue_batch_with_max_bytes_allows_one_oversized_doc() {
+        let env = TestEnvironment::new().await.unwrap();
+        let pool = env.db_pool.pool().clone();
+        let queue = EventQueue::new(pool.clone());
+
+        let oversized_id = insert_sized_content(&pool, 280).await;
+        let oversized = make_event_with_content("run-1", "oversized-doc", oversized_id);
+        queue.enqueue(TEST_SOURCE_ID, &oversized).await.unwrap();
+
+        let small_id = insert_sized_content(&pool, 1).await;
+        let small = make_event_with_content("run-1", "small-doc", small_id);
+        queue.enqueue(TEST_SOURCE_ID, &small).await.unwrap();
+
+        let batch = queue.dequeue_batch_with_max_bytes(10, 100).await.unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].payload["document_id"], "oversized-doc");
+        assert_eq!(queue.get_pending_count().await.unwrap(), 1);
+
+        let next = queue.dequeue_batch_with_max_bytes(10, 100).await.unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].payload["document_id"], "small-doc");
+    }
+
+    #[tokio::test]
+    async fn test_dequeue_batch_by_sync_type_with_max_bytes_routes_and_limits() {
+        let env = TestEnvironment::new().await.unwrap();
+        let pool = env.db_pool.pool().clone();
+        let queue = EventQueue::new(pool.clone());
+
+        let full_run = ulid::Ulid::new().to_string();
+        let inc_run = ulid::Ulid::new().to_string();
+        insert_sync_run(&pool, &full_run, "full").await;
+        insert_sync_run(&pool, &inc_run, "incremental").await;
+
+        for i in 0..2 {
+            let content_id = insert_sized_content(&pool, 60).await;
+            let event = make_event_with_content(&full_run, &format!("full-doc-{}", i), content_id);
+            queue.enqueue(TEST_SOURCE_ID, &event).await.unwrap();
+        }
+        let inc_content_id = insert_sized_content(&pool, 10).await;
+        let inc_event = make_event_with_content(&inc_run, "inc-doc", inc_content_id);
+        queue.enqueue(TEST_SOURCE_ID, &inc_event).await.unwrap();
+
+        let full_batch = queue
+            .dequeue_batch_by_sync_type_with_max_bytes(10, SyncType::Full, 100)
+            .await
+            .unwrap();
+        assert_eq!(full_batch.len(), 1);
+        assert_eq!(full_batch[0].sync_run_id, full_run);
+
+        let inc_batch = queue
+            .dequeue_batch_by_sync_type_with_max_bytes(10, SyncType::Incremental, 100)
+            .await
+            .unwrap();
+        assert_eq!(inc_batch.len(), 1);
+        assert_eq!(inc_batch[0].sync_run_id, inc_run);
+    }
+
+    #[tokio::test]
+    async fn test_dequeue_batch_orphans_with_max_bytes_limits_orphans() {
+        let env = TestEnvironment::new().await.unwrap();
+        let pool = env.db_pool.pool().clone();
+        let queue = EventQueue::new(pool.clone());
+
+        for i in 0..2 {
+            let content_id = insert_sized_content(&pool, 70).await;
+            let event =
+                make_event_with_content("missing-run", &format!("orphan-doc-{}", i), content_id);
+            queue.enqueue(TEST_SOURCE_ID, &event).await.unwrap();
+        }
+
+        let batch = queue
+            .dequeue_batch_orphans_with_max_bytes(10, 100)
+            .await
+            .unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(queue.get_pending_count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_queue_summary_reports_pending_size_bytes() {
+        let env = TestEnvironment::new().await.unwrap();
+        let pool = env.db_pool.pool().clone();
+        let queue = EventQueue::new(pool.clone());
+
+        let content_id = insert_sized_content(&pool, 42).await;
+        let event = make_event_with_content("missing-run", "sized-doc", content_id);
+        queue.enqueue(TEST_SOURCE_ID, &event).await.unwrap();
+
+        let summary = queue.get_queue_summary().await.unwrap();
+        let pending_orphan = summary
+            .entries
+            .iter()
+            .find(|entry| entry.sync_type.is_none() && entry.status == EventStatus::Pending)
+            .unwrap();
+        assert_eq!(pending_orphan.count, 1);
+        let payload_bytes: i64 = sqlx::query_scalar(
+            "SELECT pg_column_size(payload)::BIGINT FROM connector_events_queue WHERE source_id = $1 AND status = 'pending' LIMIT 1",
+        )
+        .bind(TEST_SOURCE_ID)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(pending_orphan.size_bytes, 42 + payload_bytes);
+    }
+
+    #[tokio::test]
+    async fn test_person_payload_is_counted_but_excluded_from_document_readiness() {
+        use shared::models::PersonSyncRecord;
+
+        let env = TestEnvironment::new().await.unwrap();
+        let pool = env.db_pool.pool().clone();
+        let queue = EventQueue::new(pool.clone());
+        let event = ConnectorEvent::PersonSync {
+            sync_run_id: "missing-run".into(),
+            source_id: TEST_SOURCE_ID.into(),
+            person: PersonSyncRecord {
+                external_id: "employee-1".into(),
+                email: "person@example.com".into(),
+                display_name: Some("A sufficiently large inline person payload".into()),
+                given_name: None,
+                middle_name: None,
+                surname: None,
+                job_title: None,
+                department: None,
+                division: None,
+                company_name: None,
+                office_location: None,
+                work_country: None,
+                employee_id: None,
+                employee_type: None,
+                cost_center: None,
+                grade: None,
+                band: None,
+                confirmation_status: None,
+                employment_start_date: None,
+                employment_end_date: None,
+                phone: None,
+                is_active: None,
+                top_department: None,
+                manager_external_id: None,
+                source_updated_at: None,
+            },
+        };
+        queue.enqueue(TEST_SOURCE_ID, &event).await.unwrap();
+
+        let summary = queue.get_queue_summary().await.unwrap();
+        let pending = summary
+            .entries
+            .iter()
+            .find(|entry| entry.sync_type.is_none() && entry.status == EventStatus::Pending)
+            .unwrap();
+        assert_eq!(pending.count, 1);
+        assert!(pending.size_bytes > 0);
+        assert!(
+            queue
+                .get_non_person_queue_summary()
+                .await
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+
+        let person_batch = queue
+            .dequeue_person_mutations_with_max_bytes(10, i64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(person_batch.len(), 1);
+        assert_eq!(person_batch[0].event_type, "person_sync");
+    }
+
+    #[tokio::test]
+    async fn person_dequeue_preserves_identity_fifo_across_sync_types_and_retries() {
+        use shared::models::PersonSyncRecord;
+
+        let env = TestEnvironment::new().await.unwrap();
+        let pool = env.db_pool.pool().clone();
+        let queue = EventQueue::new(pool.clone());
+        let full_run = ulid::Ulid::new().to_string();
+        let incremental_run = ulid::Ulid::new().to_string();
+        let realtime_run = ulid::Ulid::new().to_string();
+        insert_sync_run(&pool, &full_run, "full").await;
+        insert_sync_run(&pool, &incremental_run, "incremental").await;
+        insert_sync_run(&pool, &realtime_run, "realtime").await;
+
+        let person = |email: &str| PersonSyncRecord {
+            external_id: "EMP".into(),
+            email: email.into(),
+            display_name: None,
+            given_name: None,
+            middle_name: None,
+            surname: None,
+            job_title: None,
+            department: None,
+            division: None,
+            company_name: None,
+            office_location: None,
+            work_country: None,
+            employee_id: None,
+            employee_type: None,
+            cost_center: None,
+            grade: None,
+            band: None,
+            confirmation_status: None,
+            employment_start_date: None,
+            employment_end_date: None,
+            phone: None,
+            is_active: None,
+            top_department: None,
+            manager_external_id: None,
+            source_updated_at: None,
+        };
+        let first = queue
+            .enqueue(
+                TEST_SOURCE_ID,
+                &ConnectorEvent::PersonSync {
+                    sync_run_id: full_run.clone(),
+                    source_id: TEST_SOURCE_ID.into(),
+                    person: person("Person@Example.com"),
+                },
+            )
+            .await
+            .unwrap();
+        let second = queue
+            .enqueue(
+                TEST_SOURCE_ID,
+                &ConnectorEvent::PersonDeleted {
+                    sync_run_id: incremental_run.clone(),
+                    source_id: TEST_SOURCE_ID.into(),
+                    email: "person@example.com".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let third = queue
+            .enqueue(
+                TEST_SOURCE_ID,
+                &ConnectorEvent::PersonSync {
+                    sync_run_id: realtime_run.clone(),
+                    source_id: TEST_SOURCE_ID.into(),
+                    person: person("PERSON@example.com"),
+                },
+            )
+            .await
+            .unwrap();
+        let unrelated = queue
+            .enqueue(
+                TEST_SOURCE_ID,
+                &ConnectorEvent::PersonSync {
+                    sync_run_id: incremental_run.clone(),
+                    source_id: TEST_SOURCE_ID.into(),
+                    person: person("other@example.com"),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Regular sync-type dequeue never claims person events.
+        assert!(
+            queue
+                .dequeue_batch_by_sync_type(10, SyncType::Full)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Only the oldest event for an identity is eligible. An unrelated
+        // identity can proceed in the same bounded batch.
+        let initial = queue
+            .dequeue_person_mutations_with_max_bytes(10, i64::MAX)
+            .await
+            .unwrap();
+        let initial_ids: std::collections::HashSet<_> =
+            initial.iter().map(|event| event.id.as_str()).collect();
+        assert_eq!(initial_ids.len(), 2);
+        assert!(initial_ids.contains(first.as_str()));
+        assert!(initial_ids.contains(unrelated.as_str()));
+        assert!(!initial_ids.contains(second.as_str()));
+        assert!(!initial_ids.contains(third.as_str()));
+
+        queue.mark_failed(&first, "retry me").await.unwrap();
+        queue.mark_completed(&unrelated).await.unwrap();
+        assert!(
+            queue
+                .dequeue_person_mutations_with_max_bytes(10, i64::MAX)
+                .await
+                .unwrap()
+                .is_empty(),
+            "retryable failure must block newer mutations for the identity"
+        );
+
+        queue.retry_failed_events().await.unwrap();
+        let retried = queue
+            .dequeue_person_mutations_with_max_bytes(10, i64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(retried.len(), 1);
+        assert_eq!(retried[0].id, first);
+        queue.mark_completed(&first).await.unwrap();
+
+        let delete = queue
+            .dequeue_person_mutations_with_max_bytes(10, i64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(delete.len(), 1);
+        assert_eq!(delete[0].id, second);
+        queue.mark_completed(&second).await.unwrap();
+
+        let resync = queue
+            .dequeue_person_mutations_with_max_bytes(10, i64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(resync.len(), 1);
+        assert_eq!(resync[0].id, third);
+    }
+
+    #[tokio::test]
+    async fn person_fifo_expired_failure_does_not_block_identity() {
+        use shared::models::PersonSyncRecord;
+
+        let env = TestEnvironment::new().await.unwrap();
+        let pool = env.db_pool.pool().clone();
+        let queue = EventQueue::new(pool.clone());
+        let full_run = ulid::Ulid::new().to_string();
+        let newer_run = ulid::Ulid::new().to_string();
+        insert_sync_run(&pool, &full_run, "full").await;
+        insert_sync_run(&pool, &newer_run, "incremental").await;
+
+        let person = |email: &str| PersonSyncRecord {
+            external_id: "EMP".into(),
+            email: email.into(),
+            display_name: None,
+            given_name: None,
+            middle_name: None,
+            surname: None,
+            job_title: None,
+            department: None,
+            division: None,
+            company_name: None,
+            office_location: None,
+            work_country: None,
+            employee_id: None,
+            employee_type: None,
+            cost_center: None,
+            grade: None,
+            band: None,
+            confirmation_status: None,
+            employment_start_date: None,
+            employment_end_date: None,
+            phone: None,
+            is_active: None,
+            top_department: None,
+            manager_external_id: None,
+            source_updated_at: None,
+        };
+        let stale = queue
+            .enqueue(
+                TEST_SOURCE_ID,
+                &ConnectorEvent::PersonSync {
+                    sync_run_id: full_run.clone(),
+                    source_id: TEST_SOURCE_ID.into(),
+                    person: person("stale@example.com"),
+                },
+            )
+            .await
+            .unwrap();
+        let newer = queue
+            .enqueue(
+                TEST_SOURCE_ID,
+                &ConnectorEvent::PersonSync {
+                    sync_run_id: newer_run.clone(),
+                    source_id: TEST_SOURCE_ID.into(),
+                    person: person("stale@example.com"),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Age the stale event beyond the retry window and fail it.
+        sqlx::query(
+            "UPDATE connector_events_queue SET created_at = NOW() - INTERVAL '48 hours' WHERE id = $1",
+        )
+        .bind(&stale)
+        .execute(&pool)
+        .await
+        .unwrap();
+        queue.mark_failed(&stale, "transient outage").await.unwrap();
+
+        // A failed predecessor with retries remaining but outside the retry
+        // window must not block the newer mutation for the same identity.
+        let batch = queue
+            .dequeue_person_mutations_with_max_bytes(10, i64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].id, newer);
+
+        // The retry sweep dead-letters the expired failure so it never lingers.
+        queue.retry_failed_events().await.unwrap();
+        let (status,): (String,) =
+            sqlx::query_as("SELECT status FROM connector_events_queue WHERE id = $1")
+                .bind(&stale)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "dead_letter");
+    }
+
+    /// Companion: `dequeue_batch_by_sync_type` must continue to work for
+    /// events whose sync_run row exists. We applied the same `FOR UPDATE
+    /// OF q` scoping there for hygiene; this test pins that the inner
+    /// join + per-sync-type filter still routes correctly.
+    #[tokio::test]
+    async fn test_dequeue_batch_by_sync_type_routes_by_sync_runs() {
+        use shared::models::SyncType;
+
+        let env = TestEnvironment::new().await.unwrap();
+        let pool = env.db_pool.pool().clone();
+        let queue = EventQueue::new(pool.clone());
+
+        // Insert two sync_runs with different sync_types. Only one scheduled
+        // sync can be running for a source at a time, but routing is based on
+        // the sync_run type, not on whether the run is still active.
+        let full_run = ulid::Ulid::new().to_string();
+        let inc_run = ulid::Ulid::new().to_string();
+        sqlx::query(
+            r#"
+            INSERT INTO sync_runs (id, source_id, sync_type, status, started_at, completed_at, created_at, updated_at)
+            VALUES ($1, $2, 'full', 'completed', NOW(), NOW(), NOW(), NOW())
+            "#,
+        )
+        .bind(&full_run)
+        .bind(TEST_SOURCE_ID)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO sync_runs (id, source_id, sync_type, status, started_at, created_at, updated_at)
+            VALUES ($1, $2, 'incremental', 'running', NOW(), NOW(), NOW())
+            "#,
+        )
+        .bind(&inc_run)
+        .bind(TEST_SOURCE_ID)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Two events under the full sync_run, one under incremental.
+        for i in 0..2 {
+            let event = make_event(&full_run, &format!("full-doc-{}", i));
+            queue.enqueue(TEST_SOURCE_ID, &event).await.unwrap();
+        }
+        let event_inc = make_event(&inc_run, "inc-doc-1");
+        queue.enqueue(TEST_SOURCE_ID, &event_inc).await.unwrap();
+
+        // Asking for `Full` should pick up only the full-run events.
+        let full_batch = queue
+            .dequeue_batch_by_sync_type(10, SyncType::Full)
+            .await
+            .unwrap();
+        assert_eq!(full_batch.len(), 2);
+        for item in &full_batch {
+            assert_eq!(item.sync_run_id, full_run);
+        }
+
+        // The incremental event remains and is picked up by its own filter.
+        let inc_batch = queue
+            .dequeue_batch_by_sync_type(10, SyncType::Incremental)
+            .await
+            .unwrap();
+        assert_eq!(inc_batch.len(), 1);
+        assert_eq!(inc_batch[0].sync_run_id, inc_run);
+    }
+}

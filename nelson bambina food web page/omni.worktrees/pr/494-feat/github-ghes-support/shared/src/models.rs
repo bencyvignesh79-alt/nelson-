@@ -1,0 +1,1848 @@
+use axum::response::IntoResponse;
+use pgvector::Vector;
+use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
+use sqlx::FromRow;
+use sqlx::types::time::OffsetDateTime;
+use std::collections::{BTreeMap, HashMap};
+use tracing::warn;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, sqlx::Type, PartialEq)]
+#[sqlx(type_name = "varchar", rename_all = "lowercase")]
+pub enum UserRole {
+    Admin,
+    User,
+    Viewer,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, sqlx::Type, PartialEq)]
+#[sqlx(type_name = "varchar", rename_all = "snake_case")]
+pub enum AuthMethod {
+    Password,
+    MagicLink,
+    Both,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct User {
+    pub id: String,
+    pub email: String,
+    #[sqlx(default)]
+    pub password_hash: Option<String>,
+    pub full_name: Option<String>,
+    pub avatar_url: Option<String>,
+    pub role: UserRole,
+    pub is_active: bool,
+    pub auth_method: AuthMethod,
+    pub domain: Option<String>,
+    #[serde(with = "time::serde::iso8601")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::iso8601")]
+    pub updated_at: OffsetDateTime,
+    #[serde(with = "time::serde::iso8601::option")]
+    pub last_login_at: Option<OffsetDateTime>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, sqlx::Type, PartialEq)]
+#[sqlx(type_name = "varchar", rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
+pub enum UserFilterMode {
+    All,
+    Whitelist,
+    Blacklist,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, sqlx::Type, PartialEq, Eq)]
+#[sqlx(type_name = "text", rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
+pub enum SourceScope {
+    /// Admin-set-up source shared across the org. Sync uses the org credential;
+    /// MCP write tools require per-user credentials granted via OAuth.
+    Org,
+    /// Personal source owned by `created_by`. The single credential row covers
+    /// both reads and writes.
+    User,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct Source {
+    pub id: String,
+    pub name: String,
+    pub source_type: String,
+    #[serde(default)]
+    #[sqlx(default)]
+    pub integration_type: IntegrationType,
+    pub config: JsonValue,
+    pub is_active: bool,
+    pub is_deleted: bool,
+    pub scope: SourceScope,
+    pub user_filter_mode: UserFilterMode,
+    pub user_whitelist: Option<JsonValue>,
+    pub user_blacklist: Option<JsonValue>,
+    pub connector_state: Option<JsonValue>,
+    #[serde(default)]
+    pub checkpoint: Option<JsonValue>,
+    pub sync_interval_seconds: Option<i32>,
+    #[serde(with = "time::serde::iso8601")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::iso8601")]
+    pub updated_at: OffsetDateTime,
+    pub created_by: String,
+}
+
+impl Source {
+    pub fn native_source_type(&self) -> Result<SourceType, String> {
+        if self.integration_type != IntegrationType::Connector {
+            return Err(format!(
+                "source {} has integration_type {:?}, not connector",
+                self.id, self.integration_type
+            ));
+        }
+        SourceType::try_from(self.source_type.as_str())
+    }
+
+    pub fn get_user_whitelist(&self) -> Vec<String> {
+        self.user_whitelist
+            .as_ref()
+            .and_then(|list| list.as_array())
+            .map(|array| {
+                array
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn get_user_blacklist(&self) -> Vec<String> {
+        self.user_blacklist
+            .as_ref()
+            .and_then(|list| list.as_array())
+            .map(|array| {
+                array
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn should_index_user(&self, user_email: &str) -> bool {
+        match self.user_filter_mode {
+            UserFilterMode::All => true,
+            UserFilterMode::Whitelist => {
+                self.get_user_whitelist().contains(&user_email.to_string())
+            }
+            UserFilterMode::Blacklist => {
+                !self.get_user_blacklist().contains(&user_email.to_string())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct Document {
+    pub id: String,
+    pub source_id: String,
+    pub external_id: String,
+    pub title: String,
+    pub content_id: Option<String>, // Content blob ID in content_blobs table
+    pub content_type: Option<String>,
+    pub file_size: Option<i64>,
+    pub file_extension: Option<String>,
+    pub url: Option<String>,
+    pub metadata: JsonValue,
+    pub permissions: JsonValue,
+    pub attributes: JsonValue, // Structured key-value attributes for filtering
+    #[serde(with = "time::serde::iso8601")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::iso8601")]
+    pub updated_at: OffsetDateTime,
+    #[serde(with = "time::serde::iso8601")]
+    pub last_indexed_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct Embedding {
+    pub id: String,
+    pub document_id: String,
+    pub chunk_index: i32,
+    pub chunk_start_offset: i32, // Character start offset in original document
+    pub chunk_end_offset: i32,   // Character end offset in original document
+    pub embedding: Vector,
+    pub model_name: String,
+    pub dimensions: i16,
+    #[serde(with = "time::serde::iso8601")]
+    pub created_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, sqlx::Type, PartialEq, Eq, Hash)]
+#[sqlx(type_name = "varchar", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum SourceType {
+    GoogleDrive,
+    Gmail,
+    GoogleChat,
+    Confluence,
+    Jira,
+    Slack,
+    Github,
+    LocalFiles,
+    FileSystem,
+    Web,
+    Notion,
+    Hubspot,
+    OneDrive,
+    SharePoint,
+    Outlook,
+    OutlookCalendar,
+    MsTeams,
+    Fireflies,
+    Imap,
+    Clickup,
+    Linear,
+    PaperlessNgx,
+    Nextcloud,
+    GoogleAds,
+    Darwinbox,
+    Windshift,
+    Salesforce,
+    Snowflake,
+}
+
+impl SourceType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SourceType::GoogleDrive => "google_drive",
+            SourceType::Gmail => "gmail",
+            SourceType::GoogleChat => "google_chat",
+            SourceType::Confluence => "confluence",
+            SourceType::Jira => "jira",
+            SourceType::Slack => "slack",
+            SourceType::Github => "github",
+            SourceType::LocalFiles => "local_files",
+            SourceType::FileSystem => "file_system",
+            SourceType::Web => "web",
+            SourceType::Notion => "notion",
+            SourceType::Hubspot => "hubspot",
+            SourceType::OneDrive => "one_drive",
+            SourceType::SharePoint => "share_point",
+            SourceType::Outlook => "outlook",
+            SourceType::OutlookCalendar => "outlook_calendar",
+            SourceType::MsTeams => "ms_teams",
+            SourceType::Fireflies => "fireflies",
+            SourceType::Imap => "imap",
+            SourceType::Clickup => "clickup",
+            SourceType::Linear => "linear",
+            SourceType::PaperlessNgx => "paperless_ngx",
+            SourceType::Nextcloud => "nextcloud",
+            SourceType::GoogleAds => "google_ads",
+            SourceType::Darwinbox => "darwinbox",
+            SourceType::Windshift => "windshift",
+            SourceType::Salesforce => "salesforce",
+            SourceType::Snowflake => "snowflake",
+        }
+    }
+}
+
+impl std::fmt::Display for SourceType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for SourceType {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        SourceType::try_from(value)
+    }
+}
+
+impl TryFrom<&str> for SourceType {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "google_drive" => Ok(SourceType::GoogleDrive),
+            "gmail" => Ok(SourceType::Gmail),
+            "google_chat" => Ok(SourceType::GoogleChat),
+            "confluence" => Ok(SourceType::Confluence),
+            "jira" => Ok(SourceType::Jira),
+            "slack" => Ok(SourceType::Slack),
+            "github" => Ok(SourceType::Github),
+            "local_files" => Ok(SourceType::LocalFiles),
+            "file_system" => Ok(SourceType::FileSystem),
+            "web" => Ok(SourceType::Web),
+            "notion" => Ok(SourceType::Notion),
+            "hubspot" => Ok(SourceType::Hubspot),
+            "one_drive" => Ok(SourceType::OneDrive),
+            "share_point" => Ok(SourceType::SharePoint),
+            "outlook" => Ok(SourceType::Outlook),
+            "outlook_calendar" => Ok(SourceType::OutlookCalendar),
+            "ms_teams" => Ok(SourceType::MsTeams),
+            "fireflies" => Ok(SourceType::Fireflies),
+            "imap" => Ok(SourceType::Imap),
+            "clickup" => Ok(SourceType::Clickup),
+            "linear" => Ok(SourceType::Linear),
+            "paperless_ngx" => Ok(SourceType::PaperlessNgx),
+            "nextcloud" => Ok(SourceType::Nextcloud),
+            "google_ads" => Ok(SourceType::GoogleAds),
+            "darwinbox" => Ok(SourceType::Darwinbox),
+            "windshift" => Ok(SourceType::Windshift),
+            "salesforce" => Ok(SourceType::Salesforce),
+            "snowflake" => Ok(SourceType::Snowflake),
+            other => Err(format!("unknown source type: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, sqlx::Type, PartialEq, Eq, Hash)]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrationType {
+    Connector,
+    RemoteMcp,
+}
+
+impl Default for IntegrationType {
+    fn default() -> Self {
+        IntegrationType::Connector
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, sqlx::Type, PartialEq)]
+#[sqlx(type_name = "varchar", rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceProvider {
+    Google,
+    Slack,
+    Atlassian,
+    Github,
+    Microsoft,
+    Notion,
+    Hubspot,
+    Fireflies,
+    Imap,
+    Clickup,
+    Linear,
+    #[sqlx(rename = "paperless_ngx")]
+    #[serde(rename = "paperless_ngx")]
+    PaperlessNgx,
+    Nextcloud,
+    #[sqlx(rename = "google_ads")]
+    #[serde(rename = "google_ads")]
+    GoogleAds,
+    Darwinbox,
+    #[sqlx(rename = "remote_mcp")]
+    #[serde(rename = "remote_mcp")]
+    RemoteMcp,
+    Windshift,
+    Salesforce,
+    Snowflake,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, sqlx::Type, PartialEq)]
+#[sqlx(type_name = "varchar", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum AuthType {
+    Jwt,
+    ApiKey,
+    BasicAuth,
+    BearerToken,
+    BotToken,
+    #[sqlx(rename = "oauth")]
+    #[serde(rename = "oauth")]
+    OAuth,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfigurationMemoryMode {
+    Off,
+    Chat,
+    Full,
+}
+
+impl ConfigurationMemoryMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Chat => "chat",
+            Self::Full => "full",
+        }
+    }
+}
+
+impl Default for ConfigurationMemoryMode {
+    fn default() -> Self {
+        Self::Off
+    }
+}
+
+impl TryFrom<&str> for ConfigurationMemoryMode {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "off" => Ok(Self::Off),
+            "chat" => Ok(Self::Chat),
+            "full" => Ok(Self::Full),
+            _ => Err(format!("Invalid memory mode: {value}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum DoclingQualityPreset {
+    Fast,
+    Balanced,
+    Quality,
+}
+
+impl DoclingQualityPreset {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Balanced => "balanced",
+            Self::Quality => "quality",
+        }
+    }
+}
+
+impl Default for DoclingQualityPreset {
+    fn default() -> Self {
+        Self::Balanced
+    }
+}
+
+impl TryFrom<&str> for DoclingQualityPreset {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "fast" => Ok(Self::Fast),
+            "balanced" => Ok(Self::Balanced),
+            "quality" => Ok(Self::Quality),
+            _ => Err(format!("Invalid Docling quality preset: {value}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub struct GlobalConfiguration {
+    pub docling_enabled: bool,
+    pub docling_quality_preset: DoclingQualityPreset,
+    pub memory_mode_default: ConfigurationMemoryMode,
+    pub memory_llm_id: Option<String>,
+}
+
+impl Default for GlobalConfiguration {
+    fn default() -> Self {
+        Self {
+            docling_enabled: false,
+            docling_quality_preset: DoclingQualityPreset::Balanced,
+            memory_mode_default: ConfigurationMemoryMode::Off,
+            memory_llm_id: None,
+        }
+    }
+}
+
+impl GlobalConfiguration {
+    pub fn from_rows<I>(rows: I) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = (String, JsonValue)>,
+    {
+        let mut configuration = Self::default();
+
+        for (key, value) in rows {
+            match key.as_str() {
+                "docling_enabled" => {
+                    configuration.docling_enabled = extract_bool_config_value(&value, "enabled")?
+                        .ok_or_else(|| {
+                        "docling_enabled.enabled must be a boolean".to_string()
+                    })?;
+                }
+                "docling_quality_preset" => {
+                    let preset = extract_string_config_value(&value, &["preset"])?
+                        .ok_or_else(|| "docling_quality_preset.preset is required".to_string())?;
+                    configuration.docling_quality_preset =
+                        DoclingQualityPreset::try_from(preset.as_str())?;
+                }
+                "memory_mode_default" => {
+                    let mode = extract_string_config_value(&value, &["mode"])?
+                        .ok_or_else(|| "memory_mode_default.value is required".to_string())?;
+                    configuration.memory_mode_default =
+                        ConfigurationMemoryMode::try_from(mode.as_str())?;
+                }
+                "memory_llm_id" => {
+                    configuration.memory_llm_id = extract_string_config_value(&value, &[])?;
+                }
+                _ => {}
+            }
+        }
+
+        Ok(configuration)
+    }
+}
+
+fn normalize_timezone_config_value(timezone: &str) -> Option<String> {
+    let candidate = timezone.trim();
+    if candidate.is_empty() {
+        return None;
+    }
+
+    let canonical = iana_timezone_alias(candidate).unwrap_or(candidate);
+    if canonical.parse::<chrono_tz::Tz>().is_ok() {
+        Some(canonical.to_string())
+    } else {
+        warn!(timezone = %timezone, "Ignoring invalid user timezone configuration");
+        None
+    }
+}
+
+fn iana_timezone_alias(timezone: &str) -> Option<&'static str> {
+    match timezone.to_ascii_lowercase().as_str() {
+        "africa/asmera" => Some("Africa/Asmara"),
+        "africa/timbuktu" => Some("Africa/Bamako"),
+        "america/argentina/comodrivadavia" => Some("America/Argentina/Catamarca"),
+        "america/atka" => Some("America/Adak"),
+        "america/buenos_aires" => Some("America/Argentina/Buenos_Aires"),
+        "america/catamarca" => Some("America/Argentina/Catamarca"),
+        "america/coral_harbour" => Some("America/Atikokan"),
+        "america/cordoba" => Some("America/Argentina/Cordoba"),
+        "america/ensenada" => Some("America/Tijuana"),
+        "america/fort_wayne" => Some("America/Indiana/Indianapolis"),
+        "america/godthab" => Some("America/Nuuk"),
+        "america/indianapolis" => Some("America/Indiana/Indianapolis"),
+        "america/jujuy" => Some("America/Argentina/Jujuy"),
+        "america/knox_in" => Some("America/Indiana/Knox"),
+        "america/kralendijk" => Some("America/Curacao"),
+        "america/louisville" => Some("America/Kentucky/Louisville"),
+        "america/lower_princes" => Some("America/Curacao"),
+        "america/marigot" => Some("America/Port_of_Spain"),
+        "america/mendoza" => Some("America/Argentina/Mendoza"),
+        "america/montreal" => Some("America/Toronto"),
+        "america/nipigon" => Some("America/Toronto"),
+        "america/pangnirtung" => Some("America/Iqaluit"),
+        "america/porto_acre" => Some("America/Rio_Branco"),
+        "america/rainy_river" => Some("America/Winnipeg"),
+        "america/rosario" => Some("America/Argentina/Cordoba"),
+        "america/santa_isabel" => Some("America/Tijuana"),
+        "america/shiprock" => Some("America/Denver"),
+        "america/st_barthelemy" => Some("America/Port_of_Spain"),
+        "america/thunder_bay" => Some("America/Toronto"),
+        "america/virgin" => Some("America/St_Thomas"),
+        "america/yellowknife" => Some("America/Edmonton"),
+        "antarctica/south_pole" => Some("Antarctica/McMurdo"),
+        "arctic/longyearbyen" => Some("Europe/Oslo"),
+        "asia/ashkhabad" => Some("Asia/Ashgabat"),
+        "asia/calcutta" => Some("Asia/Kolkata"),
+        "asia/choibalsan" => Some("Asia/Ulaanbaatar"),
+        "asia/chongqing" => Some("Asia/Shanghai"),
+        "asia/chungking" => Some("Asia/Shanghai"),
+        "asia/dacca" => Some("Asia/Dhaka"),
+        "asia/harbin" => Some("Asia/Shanghai"),
+        "asia/istanbul" => Some("Europe/Istanbul"),
+        "asia/kashgar" => Some("Asia/Urumqi"),
+        "asia/katmandu" => Some("Asia/Kathmandu"),
+        "asia/macao" => Some("Asia/Macau"),
+        "asia/rangoon" => Some("Asia/Yangon"),
+        "asia/saigon" => Some("Asia/Ho_Chi_Minh"),
+        "asia/tel_aviv" => Some("Asia/Jerusalem"),
+        "asia/thimbu" => Some("Asia/Thimphu"),
+        "asia/ujung_pandang" => Some("Asia/Makassar"),
+        "asia/ulan_bator" => Some("Asia/Ulaanbaatar"),
+        "atlantic/faeroe" => Some("Atlantic/Faroe"),
+        "atlantic/jan_mayen" => Some("Europe/Oslo"),
+        "australia/act" => Some("Australia/Sydney"),
+        "australia/canberra" => Some("Australia/Sydney"),
+        "australia/currie" => Some("Australia/Hobart"),
+        "australia/lhi" => Some("Australia/Lord_Howe"),
+        "australia/north" => Some("Australia/Darwin"),
+        "australia/nsw" => Some("Australia/Sydney"),
+        "australia/queensland" => Some("Australia/Brisbane"),
+        "australia/south" => Some("Australia/Adelaide"),
+        "australia/tasmania" => Some("Australia/Hobart"),
+        "australia/victoria" => Some("Australia/Melbourne"),
+        "australia/west" => Some("Australia/Perth"),
+        "australia/yancowinna" => Some("Australia/Broken_Hill"),
+        "brazil/acre" => Some("America/Rio_Branco"),
+        "brazil/denoronha" => Some("America/Noronha"),
+        "brazil/east" => Some("America/Sao_Paulo"),
+        "brazil/west" => Some("America/Manaus"),
+        "canada/atlantic" => Some("America/Halifax"),
+        "canada/central" => Some("America/Winnipeg"),
+        "canada/eastern" => Some("America/Toronto"),
+        "canada/mountain" => Some("America/Edmonton"),
+        "canada/newfoundland" => Some("America/St_Johns"),
+        "canada/pacific" => Some("America/Vancouver"),
+        "canada/saskatchewan" => Some("America/Regina"),
+        "canada/yukon" => Some("America/Whitehorse"),
+        "chile/continental" => Some("America/Santiago"),
+        "chile/easterisland" => Some("Pacific/Easter"),
+        "cuba" => Some("America/Havana"),
+        "egypt" => Some("Africa/Cairo"),
+        "eire" => Some("Europe/Dublin"),
+        "etc/gmt+0" => Some("Etc/GMT"),
+        "etc/gmt-0" => Some("Etc/GMT"),
+        "etc/gmt0" => Some("Etc/GMT"),
+        "etc/greenwich" => Some("Etc/GMT"),
+        "etc/uct" => Some("Etc/UTC"),
+        "etc/universal" => Some("Etc/UTC"),
+        "etc/zulu" => Some("Etc/UTC"),
+        "europe/belfast" => Some("Europe/London"),
+        "europe/bratislava" => Some("Europe/Prague"),
+        "europe/busingen" => Some("Europe/Zurich"),
+        "europe/kiev" => Some("Europe/Kyiv"),
+        "europe/mariehamn" => Some("Europe/Helsinki"),
+        "europe/nicosia" => Some("Asia/Nicosia"),
+        "europe/podgorica" => Some("Europe/Belgrade"),
+        "europe/san_marino" => Some("Europe/Rome"),
+        "europe/tiraspol" => Some("Europe/Chisinau"),
+        "europe/uzhgorod" => Some("Europe/Kyiv"),
+        "europe/vatican" => Some("Europe/Rome"),
+        "europe/zaporozhye" => Some("Europe/Kyiv"),
+        "gb" => Some("Europe/London"),
+        "gb-eire" => Some("Europe/London"),
+        "gmt" => Some("Etc/GMT"),
+        "gmt+0" => Some("Etc/GMT"),
+        "gmt-0" => Some("Etc/GMT"),
+        "gmt0" => Some("Etc/GMT"),
+        "greenwich" => Some("Etc/GMT"),
+        "hongkong" => Some("Asia/Hong_Kong"),
+        "iceland" => Some("Atlantic/Reykjavik"),
+        "iran" => Some("Asia/Tehran"),
+        "israel" => Some("Asia/Jerusalem"),
+        "jamaica" => Some("America/Jamaica"),
+        "japan" => Some("Asia/Tokyo"),
+        "kwajalein" => Some("Pacific/Kwajalein"),
+        "libya" => Some("Africa/Tripoli"),
+        "mexico/bajanorte" => Some("America/Tijuana"),
+        "mexico/bajasur" => Some("America/Mazatlan"),
+        "mexico/general" => Some("America/Mexico_City"),
+        "navajo" => Some("America/Denver"),
+        "nz" => Some("Pacific/Auckland"),
+        "nz-chat" => Some("Pacific/Chatham"),
+        "pacific/enderbury" => Some("Pacific/Kanton"),
+        "pacific/johnston" => Some("Pacific/Honolulu"),
+        "pacific/ponape" => Some("Pacific/Pohnpei"),
+        "pacific/samoa" => Some("Pacific/Pago_Pago"),
+        "pacific/truk" => Some("Pacific/Chuuk"),
+        "pacific/yap" => Some("Pacific/Chuuk"),
+        "poland" => Some("Europe/Warsaw"),
+        "portugal" => Some("Europe/Lisbon"),
+        "prc" => Some("Asia/Shanghai"),
+        "roc" => Some("Asia/Taipei"),
+        "rok" => Some("Asia/Seoul"),
+        "singapore" => Some("Asia/Singapore"),
+        "turkey" => Some("Europe/Istanbul"),
+        "uct" => Some("Etc/UTC"),
+        "universal" => Some("Etc/UTC"),
+        "us/alaska" => Some("America/Anchorage"),
+        "us/aleutian" => Some("America/Adak"),
+        "us/arizona" => Some("America/Phoenix"),
+        "us/central" => Some("America/Chicago"),
+        "us/east-indiana" => Some("America/Indiana/Indianapolis"),
+        "us/eastern" => Some("America/New_York"),
+        "us/hawaii" => Some("Pacific/Honolulu"),
+        "us/indiana-starke" => Some("America/Indiana/Knox"),
+        "us/michigan" => Some("America/Detroit"),
+        "us/mountain" => Some("America/Denver"),
+        "us/pacific" => Some("America/Los_Angeles"),
+        "us/samoa" => Some("Pacific/Pago_Pago"),
+        "utc" => Some("UTC"),
+        "w-su" => Some("Europe/Moscow"),
+        "zulu" => Some("Etc/UTC"),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub struct UserConfiguration {
+    pub memory_mode: Option<ConfigurationMemoryMode>,
+    pub timezone: Option<String>,
+}
+
+impl UserConfiguration {
+    pub fn from_rows<I>(rows: I) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = (String, JsonValue)>,
+    {
+        let mut configuration = Self::default();
+
+        for (key, value) in rows {
+            match key.as_str() {
+                "memory_mode" => {
+                    if let Some(mode) = extract_string_config_value(&value, &["mode"])? {
+                        configuration.memory_mode =
+                            Some(ConfigurationMemoryMode::try_from(mode.as_str())?);
+                    }
+                }
+                "timezone" => {
+                    if let Some(timezone) = extract_string_config_value(&value, &["timezone"])? {
+                        configuration.timezone = normalize_timezone_config_value(&timezone);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(configuration)
+    }
+
+    pub fn timezone(&self) -> Option<&str> {
+        self.timezone
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+    }
+}
+
+fn extract_string_config_value(
+    value: &JsonValue,
+    alternate_keys: &[&str],
+) -> Result<Option<String>, String> {
+    match value {
+        JsonValue::Null => Ok(None),
+        JsonValue::String(value) => Ok(Some(value.clone())),
+        JsonValue::Object(map) => {
+            let keys = std::iter::once("value").chain(alternate_keys.iter().copied());
+            for key in keys {
+                match map.get(key) {
+                    Some(JsonValue::String(value)) => return Ok(Some(value.clone())),
+                    Some(JsonValue::Null) | None => {}
+                    Some(_) => return Err(format!("{key} must be a string")),
+                }
+            }
+            Ok(None)
+        }
+        _ => Err("value must be a string or object".to_string()),
+    }
+}
+
+fn extract_bool_config_value(value: &JsonValue, key: &str) -> Result<Option<bool>, String> {
+    match value {
+        JsonValue::Null => Ok(None),
+        JsonValue::Bool(value) => Ok(Some(*value)),
+        JsonValue::Object(map) => match map.get(key) {
+            Some(JsonValue::Bool(value)) => Ok(Some(*value)),
+            Some(JsonValue::Null) | None => Ok(None),
+            Some(_) => Err(format!("{key} must be a boolean")),
+        },
+        _ => Err("value must be a boolean or object".to_string()),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ServiceCredential {
+    pub id: String,
+    pub source_id: String,
+    /// `Some` => per-user credential for an org-wide source (used for write tools by that user).
+    /// `None` => org-wide credential (used for sync and reads).
+    pub user_id: Option<String>,
+    pub provider: ServiceProvider,
+    pub auth_type: AuthType,
+    pub principal_email: Option<String>,
+    pub credentials: JsonValue,
+    pub config: JsonValue,
+    #[serde(with = "time::serde::iso8601::option")]
+    pub expires_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::iso8601::option")]
+    pub last_validated_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::iso8601")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::iso8601")]
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ConnectorConfigRow {
+    pub provider: String,
+    pub config: JsonValue,
+    #[serde(with = "time::serde::iso8601")]
+    pub updated_at: OffsetDateTime,
+    pub updated_by: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DocumentMetadata {
+    pub title: Option<String>,
+    pub author: Option<String>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub created_at: Option<OffsetDateTime>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub updated_at: Option<OffsetDateTime>,
+    pub content_type: Option<String>,
+    pub mime_type: Option<String>,
+    pub size: Option<String>,
+    pub url: Option<String>,
+    pub path: Option<String>, // Generic display path for hierarchical context
+    pub extra: Option<HashMap<String, JsonValue>>, // Connector-specific metadata
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentPermissions {
+    pub public: bool,
+    pub users: Vec<String>,
+    pub groups: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct Group {
+    pub id: String,
+    pub source_id: String,
+    pub email: String,
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+    #[serde(with = "time::serde::iso8601")]
+    pub synced_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct GroupMembership {
+    pub id: String,
+    pub group_id: String,
+    pub member_email: String,
+    pub role: Option<String>,
+    #[serde(with = "time::serde::iso8601")]
+    pub synced_at: OffsetDateTime,
+}
+
+/// Structured attributes for filtering and faceting.
+/// Stored as JSONB, indexed by ParadeDB for FTS and filtering.
+/// NOT included in embeddings - only textual content is embedded.
+pub type DocumentAttributes = HashMap<String, JsonValue>;
+
+/// Attribute filter for search queries.
+/// Supports exact match, multi-value OR, and range queries.
+#[derive(Debug, Clone)]
+pub struct DateFilter {
+    pub after: Option<OffsetDateTime>,
+    pub before: Option<OffsetDateTime>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum AttributeFilter {
+    /// Single value exact match
+    Exact(JsonValue),
+    /// Multiple values (OR match)
+    AnyOf(Vec<JsonValue>),
+    /// Range query (for dates, numbers)
+    Range {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        gte: Option<JsonValue>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        lte: Option<JsonValue>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchOperator {
+    pub operator: String,
+    pub attribute_key: String,
+    #[serde(default = "default_search_operator_value_type")]
+    pub value_type: String, // "person", "text", "datetime"
+}
+
+fn default_search_operator_value_type() -> String {
+    "text".to_string()
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ActionMode {
+    Read,
+    Write,
+}
+
+impl Default for ActionMode {
+    /// Write is the safe default for unmarked actions — read-only sources or
+    /// connectors block them, but unmarked-and-actually-mutating actions
+    /// running as read-typed would skip that check.
+    fn default() -> Self {
+        ActionMode::Write
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionCredentialScope {
+    /// User-facing (default). The platform decides resolution: per-user
+    /// OAuth when the connector supports it, otherwise the org credential
+    /// with the actor identity carried downstream.
+    User,
+    /// Runs on the source's org-level credential (org-wide reads, setup
+    /// surfaces that are not admin-only).
+    Org,
+}
+
+impl Default for ActionCredentialScope {
+    fn default() -> Self {
+        Self::User
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ActionDefinition {
+    pub name: String,
+    pub description: String,
+    pub input_schema: JsonValue,
+    #[serde(default)]
+    pub mode: ActionMode,
+    /// Credential scope required by the action. This is intentionally
+    /// independent of how the connector implements the action.
+    #[serde(default)]
+    pub credential_scope: ActionCredentialScope,
+    /// OAuth scopes required to invoke this action, when declared by the
+    /// connector or its upstream MCP tool metadata.
+    /// `None` means the connector has not declared action-level scopes and
+    /// Omni should fall back to the coarse credential-existence check.
+    #[serde(default)]
+    pub required_scopes: Option<Vec<String>>,
+    /// Restrict this action to a subset of the connector's `source_types`.
+    /// Empty = applies to all source_types the connector supports.
+    #[serde(default)]
+    pub source_types: Vec<SourceType>,
+    /// Hide this action from non-admin users in LLM tool exposure (e.g.
+    /// admin-directory ops that require a service-account credential).
+    /// Also consulted at dispatch time to resolve credentials (see
+    /// `resolve_credentials` in connector-manager), independent of `hidden`.
+    #[serde(default)]
+    pub admin_only: bool,
+    /// Exclude this action from every chat/agent tool surface, admins
+    /// included (e.g. setup/internal actions with no chat-facing use).
+    /// Unlike `admin_only`, this is not bypassed for admin users. The
+    /// action remains in the manifest and dispatchable by name.
+    #[serde(default)]
+    pub hidden: bool,
+    /// The connector enforces that this action can only affect records
+    /// within the caller's own authority, independent of the credential
+    /// used (e.g. Darwinbox self-service writes that derive the employee
+    /// from the actor). Lets user-facing writes run on the org credential
+    /// when the provider has no per-user OAuth; without it, writes on the
+    /// org-credential path are restricted to admin callers.
+    #[serde(default)]
+    pub actor_scoped: bool,
+    /// Provenance of this action: `native` actions are declared by the
+    /// connector itself, `mcp` actions were discovered from its MCP server.
+    /// Lets dispatch enforce per-user credentials, block transient
+    /// credentials, and invalidate stale MCP catalogs without separate
+    /// name lists.
+    #[serde(default)]
+    pub origin: ActionOrigin,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionOrigin {
+    #[default]
+    Native,
+    Mcp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpResourceDefinition {
+    pub uri_template: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpPromptArgument {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpPromptDefinition {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub arguments: Vec<McpPromptArgument>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectorSkillDefinition {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub source_types: Vec<SourceType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_prompt: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectorManifest {
+    pub name: String,
+    pub display_name: String,
+    pub version: String,
+    pub sync_modes: Vec<SyncType>,
+    pub connector_id: String,
+    pub connector_url: String,
+    #[serde(default)]
+    pub integration_type: IntegrationType,
+    #[serde(default)]
+    pub source_types: Vec<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Deprecated compatibility catalog. New and migrated connectors should
+    /// publish actions in `source_capabilities`; a source-specific definition
+    /// wins over a legacy definition with the same name for that source.
+    #[serde(default)]
+    pub actions: Vec<ActionDefinition>,
+    #[serde(default)]
+    pub search_operators: Vec<SearchOperator>,
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default)]
+    pub extra_schema: Option<JsonValue>,
+    #[serde(default)]
+    pub attributes_schema: Option<JsonValue>,
+    #[serde(default)]
+    pub mcp_enabled: bool,
+    /// True when the connector has MCP tools/resources/prompts available from
+    /// live discovery or an in-memory catalog cache.
+    #[serde(default)]
+    pub mcp_catalog_loaded: bool,
+    #[serde(default)]
+    pub resources: Vec<McpResourceDefinition>,
+    #[serde(default)]
+    pub prompts: Vec<McpPromptDefinition>,
+    #[serde(default)]
+    pub skills: Vec<ConnectorSkillDefinition>,
+    /// Capabilities discovered for one exact source. Legacy top-level
+    /// capabilities remain supported during migration.
+    #[serde(default)]
+    pub source_capabilities: Vec<ConnectorSourceCapabilities>,
+    /// Declarative OAuth2 config consumed by the web app's generic OAuth
+    /// service. Connectors that use OAuth populate this. The typed shape
+    /// lives in the connector SDK (`omni_connector_sdk::OAuthManifestConfig`);
+    /// shared treats it as opaque JSON since neither shared nor
+    /// connector-manager need typed access to its fields.
+    #[serde(default)]
+    pub oauth: Option<JsonValue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectorSourceCapabilities {
+    pub source_id: String,
+    #[serde(default)]
+    pub actions: Vec<ActionDefinition>,
+    #[serde(default)]
+    pub resources: Vec<McpResourceDefinition>,
+    #[serde(default)]
+    pub prompts: Vec<McpPromptDefinition>,
+    #[serde(default)]
+    pub skills: Vec<ConnectorSkillDefinition>,
+}
+
+/// Which web OAuth flow produced a credential. Passed to the connector's
+/// validation hook so it can decide whether a binding claim applies.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthCredentialFlow {
+    OrgSource,
+    ConnectSource,
+    UserRead,
+    UserWrite,
+}
+
+/// Provider-defined identity binding returned by a connector's OAuth
+/// credential validation (e.g. Salesforce `organization_id`, a workspace id
+/// for another provider). Stored verbatim under the reserved `source_binding`
+/// key in source config; never merged into other config keys.
+pub type OAuthSourceBinding = BTreeMap<String, String>;
+
+/// Sent by connector-manager to a connector so it can validate a freshly
+/// exchanged OAuth credential before it is persisted (for example, rejecting
+/// credentials that belong to a different provider organization).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthCredentialValidationRequest {
+    pub source_id: String,
+    pub provider: String,
+    pub credentials: JsonValue,
+    pub flow: OAuthCredentialFlow,
+    #[serde(default)]
+    pub metadata: JsonValue,
+    #[serde(default)]
+    pub source: Option<Source>,
+}
+
+/// Connector response for `OAuthCredentialValidationRequest`. An error must be
+/// surfaced as an HTTP error; an empty binding means "accepted, nothing to bind".
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OAuthCredentialValidationResponse {
+    #[serde(default)]
+    pub source_binding: Option<OAuthSourceBinding>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ConnectorEvent {
+    DocumentCreated {
+        sync_run_id: String,
+        source_id: String,
+        document_id: String,
+        content_id: String,
+        metadata: DocumentMetadata,
+        permissions: DocumentPermissions,
+        #[serde(default)]
+        attributes: Option<DocumentAttributes>,
+    },
+    DocumentUpdated {
+        sync_run_id: String,
+        source_id: String,
+        document_id: String,
+        content_id: String,
+        metadata: DocumentMetadata,
+        permissions: Option<DocumentPermissions>,
+        #[serde(default)]
+        attributes: Option<DocumentAttributes>,
+    },
+    DocumentDeleted {
+        sync_run_id: String,
+        source_id: String,
+        document_id: String,
+    },
+    GroupMembershipSync {
+        sync_run_id: String,
+        source_id: String,
+        group_email: String,
+        group_name: Option<String>,
+        member_emails: Vec<String>,
+    },
+    /// Idempotently creates or updates one source-provenanced person.
+    PersonSync {
+        sync_run_id: String,
+        source_id: String,
+        person: PersonSyncRecord,
+    },
+    /// Removes one source's current knowledge of a person by canonical email.
+    PersonDeleted {
+        sync_run_id: String,
+        source_id: String,
+        email: String,
+    },
+}
+
+impl ConnectorEvent {
+    pub fn sync_run_id(&self) -> &str {
+        match self {
+            ConnectorEvent::DocumentCreated { sync_run_id, .. } => sync_run_id,
+            ConnectorEvent::DocumentUpdated { sync_run_id, .. } => sync_run_id,
+            ConnectorEvent::DocumentDeleted { sync_run_id, .. } => sync_run_id,
+            ConnectorEvent::GroupMembershipSync { sync_run_id, .. } => sync_run_id,
+            ConnectorEvent::PersonSync { sync_run_id, .. }
+            | ConnectorEvent::PersonDeleted { sync_run_id, .. } => sync_run_id,
+        }
+    }
+
+    pub fn source_id(&self) -> &str {
+        match self {
+            ConnectorEvent::DocumentCreated { source_id, .. } => source_id,
+            ConnectorEvent::DocumentUpdated { source_id, .. } => source_id,
+            ConnectorEvent::DocumentDeleted { source_id, .. } => source_id,
+            ConnectorEvent::GroupMembershipSync { source_id, .. } => source_id,
+            ConnectorEvent::PersonSync { source_id, .. }
+            | ConnectorEvent::PersonDeleted { source_id, .. } => source_id,
+        }
+    }
+
+    pub fn document_id(&self) -> &str {
+        match self {
+            ConnectorEvent::DocumentCreated { document_id, .. } => document_id,
+            ConnectorEvent::DocumentUpdated { document_id, .. } => document_id,
+            ConnectorEvent::DocumentDeleted { document_id, .. } => document_id,
+            ConnectorEvent::GroupMembershipSync { group_email, .. } => group_email,
+            ConnectorEvent::PersonSync { person, .. } => &person.email,
+            ConnectorEvent::PersonDeleted { email, .. } => email,
+        }
+    }
+
+    /// Returns true for events that mutate source-provenanced person data.
+    pub fn is_person_event(&self) -> bool {
+        matches!(
+            self,
+            ConnectorEvent::PersonSync { .. } | ConnectorEvent::PersonDeleted { .. }
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DocumentChunk {
+    pub text: String,
+    pub index: i32,
+}
+
+// Note: Document chunking is now handled by the indexer service
+// which fetches content from LOB storage and uses the ContentChunker utility
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FacetValue {
+    pub value: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Facet {
+    pub name: String,
+    pub values: Vec<FacetValue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkResult {
+    pub document_id: String,
+    pub similarity_score: f32,
+    pub chunk_start_offset: i32,
+    pub chunk_end_offset: i32,
+    pub chunk_index: i32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, sqlx::Type, PartialEq, Eq, Hash)]
+#[sqlx(type_name = "text", rename_all = "lowercase")]
+pub enum EventStatus {
+    Pending,
+    Processing,
+    Completed,
+    Failed,
+    #[serde(rename = "dead_letter")]
+    DeadLetter,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ConnectorEventQueueItem {
+    pub id: String,
+    pub sync_run_id: String,
+    pub source_id: String,
+    pub event_type: String,
+    pub payload: JsonValue,
+    pub status: EventStatus,
+    pub retry_count: i32,
+    pub max_retries: i32,
+    #[serde(with = "time::serde::iso8601")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::iso8601::option")]
+    pub processed_at: Option<OffsetDateTime>,
+    pub error_message: Option<String>,
+}
+
+/// A single source-provenanced person upsert.
+/// Only reviewed, workplace-directory-safe fields are included; personal
+/// HR fields (mobile, DOB, addresses, bank/salary data, raw provider JSON)
+/// are intentionally absent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonSyncRecord {
+    /// Stable, required, unique within the source (e.g. Darwinbox employee ID).
+    pub external_id: String,
+    /// Required business email used as the canonical human identity.
+    pub email: String,
+    /// Full display name (e.g. first + middle + last).
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub given_name: Option<String>,
+    #[serde(default)]
+    pub middle_name: Option<String>,
+    #[serde(default)]
+    pub surname: Option<String>,
+    #[serde(default)]
+    pub job_title: Option<String>,
+    #[serde(default)]
+    pub department: Option<String>,
+    #[serde(default)]
+    pub division: Option<String>,
+    #[serde(default)]
+    pub company_name: Option<String>,
+    #[serde(default)]
+    pub office_location: Option<String>,
+    #[serde(default)]
+    pub work_country: Option<String>,
+    #[serde(default)]
+    pub employee_id: Option<String>,
+    #[serde(default)]
+    pub employee_type: Option<String>,
+    #[serde(default)]
+    pub cost_center: Option<String>,
+    #[serde(default)]
+    pub grade: Option<String>,
+    #[serde(default)]
+    pub band: Option<String>,
+    #[serde(default)]
+    pub confirmation_status: Option<String>,
+    #[serde(default)]
+    pub employment_start_date: Option<String>,
+    #[serde(default)]
+    pub employment_end_date: Option<String>,
+    /// Contact phone number (e.g. Darwinbox `personal_mobile_no`).
+    #[serde(default)]
+    pub phone: Option<String>,
+    /// Source-reported employment activity. `None` means leave the people
+    /// row's current value untouched; only a source-provided value should map.
+    #[serde(default)]
+    pub is_active: Option<bool>,
+    /// Parent org unit (e.g. Darwinbox `top_department`).
+    #[serde(default)]
+    pub top_department: Option<String>,
+    /// Manager's external ID within the same source.
+    #[serde(default)]
+    pub manager_external_id: Option<String>,
+    /// Provider-side modification timestamp (e.g. latest_modified_any_attribute).
+    #[serde(default)]
+    pub source_updated_at: Option<String>,
+}
+
+/// Type/mode of a sync run. Serializes as a lowercase string on the wire
+/// (`"full"`, `"incremental"`, `"realtime"`).
+///
+/// TODO: the Python (`sdk/python/omni_connector/models.py`) and TypeScript
+/// (`sdk/typescript/src/models.ts`) SDKs currently expose this enum as
+/// `SyncMode` with only `FULL` and `INCREMENTAL`. They should be renamed to
+/// `SyncType` and grow a `REALTIME` variant to match the Rust canonical name.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, sqlx::Type, PartialEq, Eq, Hash)]
+#[sqlx(type_name = "varchar", rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
+pub enum SyncType {
+    Full,
+    Incremental,
+    Realtime,
+}
+
+impl std::fmt::Display for SyncType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SyncType::Full => write!(f, "full"),
+            SyncType::Incremental => write!(f, "incremental"),
+            SyncType::Realtime => write!(f, "realtime"),
+        }
+    }
+}
+
+impl SyncType {
+    /// Concurrency slot a sync of this type occupies on a source. Realtime
+    /// watchers run in a separate slot from batch (Full/Incremental) syncs,
+    /// so a long-running realtime sync does not block scheduled scans.
+    pub fn slot_class(&self) -> SyncSlotClass {
+        match self {
+            SyncType::Realtime => SyncSlotClass::Realtime,
+            SyncType::Full | SyncType::Incremental => SyncSlotClass::Scheduled,
+        }
+    }
+}
+
+/// Per-source concurrency slot. One Realtime and one Scheduled sync may run
+/// concurrently for the same source; two of the same class cannot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SyncSlotClass {
+    Scheduled,
+    Realtime,
+}
+
+impl std::fmt::Display for SyncSlotClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SyncSlotClass::Scheduled => write!(f, "scheduled"),
+            SyncSlotClass::Realtime => write!(f, "realtime"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, sqlx::Type, PartialEq)]
+#[sqlx(type_name = "varchar", rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
+pub enum SyncStatus {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct SyncRun {
+    pub id: String,
+    pub source_id: String,
+    pub sync_type: SyncType,
+    #[serde(with = "time::serde::iso8601::option")]
+    pub started_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::iso8601::option")]
+    pub completed_at: Option<OffsetDateTime>,
+    pub status: SyncStatus,
+    pub trigger_type: String,
+    pub documents_scanned: i32,
+    pub documents_processed: i32,
+    pub documents_updated: i32,
+    pub error_message: Option<String>,
+    #[serde(default)]
+    pub checkpoint: Option<JsonValue>,
+    #[serde(with = "time::serde::iso8601")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::iso8601")]
+    pub updated_at: OffsetDateTime,
+}
+
+/// Request sent from connector-manager to connectors to trigger a sync.
+/// Connectors fetch their own source config and credentials from the database.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncRequest {
+    pub sync_run_id: String,
+    pub source_id: String,
+    pub sync_mode: SyncType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sync_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<JsonValue>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_resume: bool,
+}
+
+/// Response from connector after receiving a sync request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncResponse {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl SyncResponse {
+    pub fn started() -> Self {
+        Self {
+            status: "started".to_string(),
+            message: None,
+        }
+    }
+
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
+            status: "error".to_string(),
+            message: Some(message.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelRequest {
+    pub sync_run_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelResponse {
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncStatusResponse {
+    pub running: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionResponse {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<JsonValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl ActionResponse {
+    pub fn success(result: JsonValue) -> Self {
+        Self {
+            status: "success".to_string(),
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    pub fn failure(message: impl Into<String>) -> Self {
+        Self {
+            status: "error".to_string(),
+            result: None,
+            error: Some(message.into()),
+        }
+    }
+
+    pub fn not_supported(action: &str) -> Self {
+        Self::failure(format!("Action not supported: {}", action))
+    }
+
+    /// Serialize this ActionResponse into an axum HTTP Response with the
+    /// default status code (200 for success, 400 for error).
+    pub fn into_response(self) -> axum::response::Response {
+        let status = match self.status.as_str() {
+            "success" => axum::http::StatusCode::OK,
+            _ => axum::http::StatusCode::BAD_REQUEST,
+        };
+        self.into_response_with_status(status)
+    }
+
+    /// Serialize this ActionResponse into an axum HTTP Response with a
+    /// specific status code.
+    pub fn into_response_with_status(
+        self,
+        status: axum::http::StatusCode,
+    ) -> axum::response::Response {
+        let body = serde_json::to_string(&self).unwrap_or_default();
+        (status, [("content-type", "application/json")], body).into_response()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct McpCredentials {
+    /// The provider-specific credentials blob (e.g. `{token: "..."}`).
+    #[serde(default)]
+    pub credentials: JsonValue,
+    /// The provider-specific service config blob.
+    #[serde(default)]
+    pub config: JsonValue,
+    /// Credential auth type. Required by connectors that share their normal
+    /// credential-loading path for MCP auth preparation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_type: Option<AuthType>,
+    /// Optional persisted source and acting user identity. These are trusted
+    /// routing metadata, not provider credentials, and are used to isolate
+    /// stateful MCP subprocesses per source/user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    /// Optional acting-user email (for delegated/principal-aware connectors).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_email: Option<String>,
+}
+
+impl McpCredentials {
+    /// Convert a typed `ServiceCredential` into the wrapper shape that
+    /// connector MCP resource/prompt endpoints receive.
+    pub fn from_service_credential(creds: &ServiceCredential) -> Self {
+        Self {
+            credentials: creds.credentials.clone(),
+            config: creds.config.clone(),
+            auth_type: Some(creds.auth_type),
+            source_id: Some(creds.source_id.clone()),
+            user_id: creds.user_id.clone(),
+            principal_email: creds.principal_email.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceRequest {
+    pub uri: String,
+    #[serde(default)]
+    pub credentials: McpCredentials,
+    /// Exact source selected by connector-manager. Legacy connectors may ignore it.
+    #[serde(default)]
+    pub source: Option<Source>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptRequest {
+    pub name: String,
+    #[serde(default)]
+    pub arguments: Option<JsonValue>,
+    #[serde(default)]
+    pub credentials: McpCredentials,
+    /// Exact source selected by connector-manager. Legacy connectors may ignore it.
+    #[serde(default)]
+    pub source: Option<Source>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillRequest {
+    pub skill_id: String,
+    #[serde(default)]
+    pub arguments: Option<JsonValue>,
+    #[serde(default)]
+    pub credentials: McpCredentials,
+    /// Trusted source selected by connector-manager for source-scoped skills.
+    #[serde(default)]
+    pub source: Option<Source>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillResponse {
+    pub skill_id: String,
+    pub title: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionRequest {
+    pub action: String,
+    #[serde(default)]
+    pub params: JsonValue,
+    #[serde(default)]
+    pub credentials: Option<ServiceCredential>,
+    /// Trusted source configuration populated by connector-manager.
+    /// Connectors deserialize their own typed policy from this.
+    #[serde(default)]
+    pub source: Option<Source>,
+    /// Authenticated actor email, resolved by connector-manager.
+    /// None = system/background execution.
+    #[serde(default)]
+    pub actor_email: Option<String>,
+    /// Authenticated actor ID, resolved by connector-manager.
+    #[serde(default)]
+    pub actor_user_id: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ApprovedDomain {
+    pub id: String,
+    pub domain: String,
+    pub approved_by: String,
+    #[serde(with = "time::serde::iso8601")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::iso8601")]
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct MagicLink {
+    pub id: String,
+    pub email: String,
+    pub token_hash: String,
+    pub expires_at: OffsetDateTime,
+    #[serde(with = "time::serde::iso8601::option")]
+    pub used_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::iso8601")]
+    pub created_at: OffsetDateTime,
+    pub user_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct Person {
+    pub id: String,
+    pub email: String,
+    pub display_name: Option<String>,
+    pub given_name: Option<String>,
+    pub surname: Option<String>,
+    pub avatar_url: Option<String>,
+    pub job_title: Option<String>,
+    pub department: Option<String>,
+    pub division: Option<String>,
+    pub company_name: Option<String>,
+    pub office_location: Option<String>,
+    pub city: Option<String>,
+    pub state: Option<String>,
+    pub country: Option<String>,
+    pub employee_id: Option<String>,
+    pub employee_type: Option<String>,
+    pub cost_center: Option<String>,
+    pub manager_id: Option<String>,
+    pub is_active: bool,
+    pub metadata: JsonValue,
+    pub external_id: Option<String>,
+    #[serde(with = "time::serde::iso8601")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::iso8601")]
+    pub updated_at: OffsetDateTime,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn make_source(
+        filter_mode: UserFilterMode,
+        whitelist: Option<JsonValue>,
+        blacklist: Option<JsonValue>,
+    ) -> Source {
+        Source {
+            id: "src-1".to_string(),
+            name: "Test".to_string(),
+            source_type: SourceType::Web.to_string(),
+            integration_type: IntegrationType::Connector,
+            config: json!({}),
+            is_active: true,
+            is_deleted: false,
+            scope: SourceScope::User,
+            user_filter_mode: filter_mode,
+            user_whitelist: whitelist,
+            user_blacklist: blacklist,
+            connector_state: None,
+            checkpoint: None,
+            sync_interval_seconds: None,
+            created_at: OffsetDateTime::now_utc(),
+            updated_at: OffsetDateTime::now_utc(),
+            created_by: "admin".to_string(),
+        }
+    }
+
+    #[test]
+    fn integration_type_uses_text_sqlx_type_and_snake_case_json() {
+        use sqlx::{Postgres, Type, TypeInfo};
+
+        assert_eq!(
+            <IntegrationType as Type<Postgres>>::type_info().name(),
+            "text"
+        );
+        assert_eq!(
+            serde_json::to_string(&IntegrationType::RemoteMcp).unwrap(),
+            "\"remote_mcp\""
+        );
+    }
+
+    #[test]
+    fn test_user_configuration_normalizes_timezone_aliases() {
+        let configuration = UserConfiguration::from_rows(vec![(
+            "timezone".to_string(),
+            json!({ "value": "Asia/Calcutta" }),
+        )])
+        .unwrap();
+
+        assert_eq!(configuration.timezone.as_deref(), Some("Asia/Kolkata"));
+    }
+
+    #[test]
+    fn test_user_configuration_ignores_invalid_timezone() {
+        let configuration = UserConfiguration::from_rows(vec![(
+            "timezone".to_string(),
+            json!({ "value": "Not/AZone" }),
+        )])
+        .unwrap();
+
+        assert_eq!(configuration.timezone, None);
+    }
+
+    #[test]
+    fn test_should_index_user_all_mode() {
+        let source = make_source(UserFilterMode::All, None, None);
+        assert!(source.should_index_user("anyone@example.com"));
+        assert!(source.should_index_user(""));
+    }
+
+    #[test]
+    fn test_should_index_user_whitelist() {
+        let source = make_source(
+            UserFilterMode::Whitelist,
+            Some(json!(["alice@corp.com", "bob@corp.com"])),
+            None,
+        );
+        assert!(source.should_index_user("alice@corp.com"));
+        assert!(source.should_index_user("bob@corp.com"));
+        assert!(!source.should_index_user("eve@corp.com"));
+    }
+
+    #[test]
+    fn test_should_index_user_blacklist() {
+        let source = make_source(
+            UserFilterMode::Blacklist,
+            None,
+            Some(json!(["blocked@corp.com"])),
+        );
+        assert!(!source.should_index_user("blocked@corp.com"));
+        assert!(source.should_index_user("allowed@corp.com"));
+    }
+
+    #[test]
+    fn test_get_user_whitelist_none() {
+        let source = make_source(UserFilterMode::All, None, None);
+        assert!(source.get_user_whitelist().is_empty());
+    }
+
+    #[test]
+    fn test_get_user_whitelist_valid() {
+        let source = make_source(
+            UserFilterMode::Whitelist,
+            Some(json!(["a@b.com", "c@d.com"])),
+            None,
+        );
+        assert_eq!(
+            source.get_user_whitelist(),
+            vec!["a@b.com".to_string(), "c@d.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_get_user_blacklist_valid() {
+        let source = make_source(UserFilterMode::Blacklist, None, Some(json!(["x@y.com"])));
+        assert_eq!(source.get_user_blacklist(), vec!["x@y.com".to_string()]);
+    }
+
+    #[test]
+    fn test_attribute_filter_exact_string_deserialization() {
+        let filter: AttributeFilter = serde_json::from_value(json!("engineering")).unwrap();
+        assert!(matches!(filter, AttributeFilter::Exact(_)));
+    }
+
+    #[test]
+    fn test_attribute_filter_exact_number_deserialization() {
+        let filter: AttributeFilter = serde_json::from_value(json!(42)).unwrap();
+        assert!(matches!(filter, AttributeFilter::Exact(_)));
+    }
+
+    #[test]
+    fn test_attribute_filter_exact_round_trips() {
+        let original = AttributeFilter::Exact(json!("team-a"));
+        let serialized = serde_json::to_value(&original).unwrap();
+        let deserialized: AttributeFilter = serde_json::from_value(serialized).unwrap();
+        if let AttributeFilter::Exact(v) = deserialized {
+            assert_eq!(v, json!("team-a"));
+        } else {
+            panic!("Expected Exact variant");
+        }
+    }
+
+    #[test]
+    fn test_attribute_filter_any_of_serializes_as_array() {
+        let filter = AttributeFilter::AnyOf(vec![json!("a"), json!("b")]);
+        let serialized = serde_json::to_value(&filter).unwrap();
+        assert!(serialized.is_array());
+        assert_eq!(serialized.as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_attribute_filter_range_serializes_with_gte_lte() {
+        let filter = AttributeFilter::Range {
+            gte: Some(json!(10)),
+            lte: Some(json!(100)),
+        };
+        let serialized = serde_json::to_value(&filter).unwrap();
+        assert_eq!(serialized["gte"], json!(10));
+        assert_eq!(serialized["lte"], json!(100));
+    }
+
+    #[test]
+    fn test_connector_event_accessors() {
+        let event = ConnectorEvent::DocumentCreated {
+            sync_run_id: "run-1".to_string(),
+            source_id: "src-1".to_string(),
+            document_id: "doc-1".to_string(),
+            content_id: "cnt-1".to_string(),
+            metadata: DocumentMetadata::default(),
+            permissions: DocumentPermissions {
+                public: false,
+                users: vec![],
+                groups: vec![],
+            },
+            attributes: None,
+        };
+        assert_eq!(event.sync_run_id(), "run-1");
+        assert_eq!(event.source_id(), "src-1");
+        assert_eq!(event.document_id(), "doc-1");
+
+        let deleted = ConnectorEvent::DocumentDeleted {
+            sync_run_id: "run-2".to_string(),
+            source_id: "src-2".to_string(),
+            document_id: "doc-2".to_string(),
+        };
+        assert_eq!(deleted.sync_run_id(), "run-2");
+        assert_eq!(deleted.source_id(), "src-2");
+        assert_eq!(deleted.document_id(), "doc-2");
+    }
+}

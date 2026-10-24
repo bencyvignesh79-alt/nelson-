@@ -1,0 +1,260 @@
+use omni_connector_sdk::{ConnectorEvent, DocumentPermissions};
+use std::collections::HashMap;
+use time::OffsetDateTime;
+
+use omni_atlassian_connector::models::{
+    ConfluenceContent, ConfluenceCqlPage, ConfluenceCqlSpace, ConfluenceCqlVersion, ConfluencePage,
+    ConfluencePageBody, ConfluencePageLinks, ConfluencePageStatus, ConfluenceVersion, JiraFields,
+    JiraIssue, JiraIssueType, JiraProject, JiraStatus, JiraStatusCategory,
+};
+
+const TEST_BASE_URL: &str = "https://test-company.atlassian.net";
+
+#[tokio::test]
+async fn test_confluence_page_to_connector_event() {
+    let page = make_test_confluence_page();
+
+    let permissions = DocumentPermissions {
+        public: false,
+        users: vec!["user@example.com".to_string()],
+        groups: vec![],
+    };
+
+    let event = page.to_connector_event(
+        "sync-run-1".to_string(),
+        "source-123".to_string(),
+        TEST_BASE_URL,
+        "content-abc".to_string(),
+        permissions,
+    );
+
+    match event {
+        ConnectorEvent::DocumentCreated {
+            sync_run_id,
+            source_id,
+            document_id,
+            content_id,
+            metadata,
+            permissions,
+            ..
+        } => {
+            assert_eq!(sync_run_id, "sync-run-1");
+            assert_eq!(source_id, "source-123");
+            assert_eq!(document_id, "confluence_page_98765_123456");
+            assert_eq!(content_id, "content-abc");
+            assert_eq!(metadata.title, Some("Test Page".to_string()));
+            assert!(metadata.url.unwrap().contains("/wiki"));
+            assert!(!permissions.public);
+            assert_eq!(permissions.users, vec!["user@example.com"]);
+        }
+        _ => panic!("Expected DocumentCreated event"),
+    }
+}
+
+#[tokio::test]
+async fn test_jira_issue_to_connector_event() {
+    let issue = make_test_jira_issue();
+
+    let permissions = DocumentPermissions {
+        public: false,
+        users: vec!["dev@example.com".to_string()],
+        groups: vec!["52c93b91-9d3d-4e3e-8b60-7c7da4a76c11".to_string()],
+    };
+
+    let event = issue.to_connector_event(
+        "sync-run-2".to_string(),
+        "source-456".to_string(),
+        TEST_BASE_URL,
+        "content-def".to_string(),
+        permissions,
+    );
+
+    match event {
+        ConnectorEvent::DocumentCreated {
+            document_id,
+            metadata,
+            permissions,
+            attributes,
+            ..
+        } => {
+            assert_eq!(document_id, "jira_issue_PROJ_PROJ-123");
+            assert_eq!(metadata.title, Some("PROJ-123 - Test Issue".to_string()));
+            assert!(metadata.url.unwrap().contains("/browse/PROJ-123"));
+            assert!(!permissions.public);
+            assert_eq!(permissions.users, vec!["dev@example.com"]);
+            assert_eq!(
+                permissions.groups,
+                vec!["52c93b91-9d3d-4e3e-8b60-7c7da4a76c11"]
+            );
+
+            let attrs = attributes.unwrap();
+            assert_eq!(attrs.get("issue_type").unwrap(), "Bug");
+            assert_eq!(attrs.get("status").unwrap(), "Open");
+            assert_eq!(attrs.get("project_key").unwrap(), "PROJ");
+        }
+        _ => panic!("Expected DocumentCreated event"),
+    }
+}
+
+#[tokio::test]
+async fn test_confluence_page_extract_plain_text() {
+    let mut page = make_test_confluence_page();
+    page.body = Some(ConfluencePageBody {
+        storage: Some(ConfluenceContent {
+            value: "<p>Hello <strong>world</strong></p>".to_string(),
+            representation: "storage".to_string(),
+        }),
+        atlas_doc_format: None,
+    });
+
+    let text = page.extract_plain_text();
+    assert_eq!(text, "Hello world");
+}
+
+#[tokio::test]
+async fn test_cql_page_conversion() {
+    let cql_page = ConfluenceCqlPage {
+        id: "111".to_string(),
+        title: "CQL Page".to_string(),
+        status: "current".to_string(),
+        content_type: "page".to_string(),
+        space: Some(ConfluenceCqlSpace {
+            id: Some(222),
+            key: "DEV".to_string(),
+            name: "Development".to_string(),
+        }),
+        version: Some(ConfluenceCqlVersion {
+            number: 3,
+            when: "2024-06-15T10:00:00.000Z".to_string(),
+            minor_edit: false,
+        }),
+        body: None,
+        links: None,
+    };
+
+    let page = cql_page.into_confluence_page();
+    assert!(page.is_some());
+
+    let page = page.unwrap();
+    assert_eq!(page.id, "111");
+    assert_eq!(page.title, "CQL Page");
+    assert_eq!(page.space_id, "222");
+    assert_eq!(page.version.number, 3);
+    assert_eq!(page.status, ConfluencePageStatus::Current);
+}
+
+#[tokio::test]
+async fn test_cql_page_conversion_without_space_returns_none() {
+    let cql_page = ConfluenceCqlPage {
+        id: "111".to_string(),
+        title: "No Space Page".to_string(),
+        status: "current".to_string(),
+        content_type: "page".to_string(),
+        space: None,
+        version: Some(ConfluenceCqlVersion {
+            number: 1,
+            when: "2024-01-01T00:00:00.000Z".to_string(),
+            minor_edit: false,
+        }),
+        body: None,
+        links: None,
+    };
+
+    assert!(cql_page.into_confluence_page().is_none());
+}
+
+#[tokio::test]
+async fn test_cql_page_conversion_without_version_returns_none() {
+    let cql_page = ConfluenceCqlPage {
+        id: "111".to_string(),
+        title: "No Version Page".to_string(),
+        status: "current".to_string(),
+        content_type: "page".to_string(),
+        space: Some(ConfluenceCqlSpace {
+            id: Some(222),
+            key: "DEV".to_string(),
+            name: "Development".to_string(),
+        }),
+        version: None,
+        body: None,
+        links: None,
+    };
+
+    assert!(cql_page.into_confluence_page().is_none());
+}
+
+// --- Helpers ---
+
+fn make_test_confluence_page() -> ConfluencePage {
+    ConfluencePage {
+        id: "123456".to_string(),
+        status: ConfluencePageStatus::Current,
+        title: "Test Page".to_string(),
+        space_id: "98765".to_string(),
+        parent_id: None,
+        parent_type: None,
+        position: None,
+        author_id: "user123".to_string(),
+        owner_id: None,
+        last_owner_id: None,
+        subtype: None,
+        created_at: OffsetDateTime::now_utc(),
+        version: ConfluenceVersion {
+            created_at: OffsetDateTime::now_utc(),
+            message: String::new(),
+            number: 1,
+            minor_edit: false,
+            author_id: "user123".to_string(),
+        },
+        body: None,
+        links: ConfluencePageLinks {
+            webui: "/spaces/TEST/pages/123456/Test+Page".to_string(),
+            editui: String::new(),
+            tinyui: String::new(),
+        },
+    }
+}
+
+fn make_test_jira_issue() -> JiraIssue {
+    JiraIssue {
+        id: "10001".to_string(),
+        key: "PROJ-123".to_string(),
+        self_url: format!("{}/rest/api/3/issue/10001", TEST_BASE_URL),
+        fields: JiraFields {
+            summary: "Test Issue".to_string(),
+            description: None,
+            issuetype: JiraIssueType {
+                id: "1".to_string(),
+                name: "Bug".to_string(),
+                icon_url: None,
+            },
+            status: JiraStatus {
+                id: "1".to_string(),
+                name: "Open".to_string(),
+                status_category: JiraStatusCategory {
+                    id: 1,
+                    name: "New".to_string(),
+                    key: "new".to_string(),
+                    color_name: "blue-gray".to_string(),
+                },
+            },
+            priority: None,
+            assignee: None,
+            reporter: None,
+            creator: None,
+            project: JiraProject {
+                id: "10000".to_string(),
+                key: "PROJ".to_string(),
+                name: "Test Project".to_string(),
+                avatar_urls: None,
+            },
+            created: "2024-01-01T10:00:00.000+0000".to_string(),
+            updated: "2024-01-01T10:00:00.000+0000".to_string(),
+            labels: None,
+            comment: None,
+            components: None,
+            security: None,
+            extra_fields: HashMap::new(),
+        },
+    }
+}

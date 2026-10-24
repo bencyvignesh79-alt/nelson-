@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <link
+            rel="icon"
+            href="%sveltekit.assets%/favicon-dark.png"
+            media="(prefers-color-scheme: dark)" />
+        <link rel="icon" href="%sveltekit.assets%/favicon-light.png" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <link rel="manifest" href="%sveltekit.assets%/manifest.webmanifest" />
+        <link
+            rel="apple-touch-icon"
+            sizes="180x180"
+            href="%sveltekit.assets%/apple-touch-icon.png" />
+        <meta name="theme-color" content="#fbfaf7" media="(prefers-color-scheme: light)" />
+        <meta name="theme-color" content="#060a12" media="(prefers-color-scheme: dark)" />
+        <meta name="mobile-web-app-capable" content="yes" />
+        <meta name="apple-mobile-web-app-capable" content="yes" />
+        <meta name="apple-mobile-web-app-title" content="omni" />
+        <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+        <script>
+            ;(function () {
+                try {
+                    var prefs = JSON.parse(localStorage.getItem('omni-user-preferences') || '{}')
+                    if (prefs.theme === 'bright') {
+                        prefs.theme = 'light'
+                    }
+                    if (prefs.theme) {
+                        var effectiveTheme = prefs.theme
+                        if (prefs.theme === 'system') {
+                            effectiveTheme = window.matchMedia('(prefers-color-scheme: dark)')
+                                .matches
+                                ? 'dark'
+                                : 'light'
+                        }
+                        document.documentElement.setAttribute('data-theme', effectiveTheme)
+                        // themeColorScheme was added later; fall back to effective theme-id check for migration
+                        var isDark =
+                            prefs.theme === 'system'
+                                ? effectiveTheme === 'dark'
+                                : prefs.themeColorScheme
+                                  ? prefs.themeColorScheme === 'dark'
+                                  : effectiveTheme === 'dark'
+                        if (isDark) {
+                            document.documentElement.classList.add('dark')
+                        }
+                    }
+                } catch (e) {}
+            })()
+        </script>
+        %sveltekit.head%
+    </head>
+    <body data-sveltekit-preload-data="hover">
+        <div style="display: contents">%sveltekit.body%</div>
+    </body>
+</html>

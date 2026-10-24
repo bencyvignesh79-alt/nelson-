@@ -1,0 +1,221 @@
+pub mod mock_atlassian;
+
+use anyhow::Result;
+use mock_atlassian::MockAtlassianApi;
+use omni_connector_manager::{AppState, config::ConnectorManagerConfig, create_app};
+use omni_connector_sdk::SdkClient;
+use redis::AsyncCommands;
+use shared::ObjectStorage;
+use shared::db::repositories::service_credentials::ServiceCredentialsRepo;
+use shared::models::{
+    AuthType, ConnectorManifest, IntegrationType, ServiceCredential, ServiceProvider, SourceType,
+    SyncType,
+};
+use shared::storage::postgres::PostgresStorage;
+use shared::test_environment::TestEnvironment;
+use sqlx::PgPool;
+use std::sync::Arc;
+use time::OffsetDateTime;
+use tokio::net::TcpListener;
+
+const TEST_CRED_ID: &str = "01JTEST0ATLASSIAN0CRED0001";
+pub const TEST_DOMAIN: &str = "test-company.atlassian.net";
+pub const TEST_CLOUD_ID: &str = "00000000-0000-0000-0000-000000000001";
+pub const TEST_SA_TOKEN: &str = "ATSTT-test-sa-token";
+
+pub struct TestFixture {
+    pub mock_api: Arc<MockAtlassianApi>,
+    pub sdk_client: SdkClient,
+    pub state: AppState,
+    pub pool: PgPool,
+    _test_env: TestEnvironment,
+    _server_handle: tokio::task::JoinHandle<()>,
+}
+
+pub async fn setup_test_fixture(source_type: SourceType) -> Result<TestFixture> {
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe {
+        std::env::set_var(
+            "ENCRYPTION_KEY",
+            "test_master_key_that_is_long_enough_32_chars",
+        )
+    };
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("ENCRYPTION_SALT", "test_salt_16_chars") };
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("CONNECTOR_HOST_NAME", "localhost") };
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("PORT", "0") };
+
+    let test_env = TestEnvironment::new().await?;
+
+    // Seed Atlassian source and credentials
+    seed_atlassian_source(test_env.db_pool.pool(), source_type).await?;
+
+    let config = ConnectorManagerConfig {
+        database: test_env.database_config(),
+        redis: test_env.redis_config(),
+        port: 0,
+        max_concurrent_syncs: 2,
+        max_concurrent_syncs_per_type: 3,
+        scheduler_interval_seconds: 600,
+        stale_sync_timeout_minutes: 1,
+        extraction_concurrency: 2,
+        extraction_retry_after_seconds: 30,
+        sync_backoff_base_seconds: 30,
+        sync_backoff_max_seconds: 3600,
+        sync_max_consecutive_failures: 10,
+    };
+
+    let content_storage: Arc<dyn ObjectStorage> =
+        Arc::new(PostgresStorage::new(test_env.db_pool.pool().clone()));
+
+    let redis_client = redis::Client::open(config.redis.redis_url.clone())?;
+
+    // Register a dummy connector in Redis so trigger_sync can find it.
+    // The URL is unreachable, but tests that trigger syncs tolerate the connector
+    // call failure — they only verify the sync run gets created.
+    let manifest = ConnectorManifest {
+        name: "atlassian".to_string(),
+        display_name: "Atlassian".to_string(),
+        version: "1.0.0".to_string(),
+        sync_modes: vec![SyncType::Full],
+        connector_id: "atlassian".to_string(),
+        connector_url: "http://127.0.0.1:1".to_string(),
+        integration_type: IntegrationType::Connector,
+        source_types: vec![
+            SourceType::Confluence.to_string(),
+            SourceType::Jira.to_string(),
+        ],
+        description: None,
+        actions: vec![],
+        search_operators: vec![],
+        read_only: false,
+        extra_schema: None,
+        attributes_schema: None,
+        mcp_enabled: false,
+        mcp_catalog_loaded: false,
+        resources: vec![],
+        prompts: vec![],
+        skills: vec![],
+        source_capabilities: vec![],
+        oauth: None,
+    };
+    let manifest_json = serde_json::to_string(&manifest)?;
+    let mut redis_conn = redis_client.get_multiplexed_async_connection().await?;
+    let _: () = redis_conn
+        .set_ex("connector:manifest:atlassian", &manifest_json, 600)
+        .await?;
+
+    let sync_manager = Arc::new(omni_connector_manager::sync_manager::SyncManager::new(
+        &test_env.db_pool,
+        config.clone(),
+        redis_client.clone(),
+    ));
+
+    let app_state = AppState {
+        db_pool: test_env.db_pool.clone(),
+        redis_client,
+        extraction_semaphore: Arc::new(tokio::sync::Semaphore::new(config.extraction_concurrency)),
+        config,
+        sync_manager,
+        content_storage,
+    };
+
+    let app = create_app(app_state.clone());
+
+    // Start the connector-manager on a random port
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let server_handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let sdk_client = SdkClient::new(&format!("http://127.0.0.1:{}", port));
+
+    let mock_api = Arc::new(MockAtlassianApi::new());
+
+    let pool = test_env.db_pool.pool().clone();
+
+    Ok(TestFixture {
+        mock_api,
+        sdk_client,
+        state: app_state,
+        pool,
+        _test_env: test_env,
+        _server_handle: server_handle,
+    })
+}
+
+async fn seed_atlassian_source(pool: &PgPool, source_type: SourceType) -> Result<()> {
+    let source_type_str = match source_type {
+        SourceType::Confluence => "confluence",
+        SourceType::Jira => "jira",
+        _ => return Err(anyhow::anyhow!("Unsupported source type for test")),
+    };
+
+    // Update the existing test source to be an Atlassian source
+    sqlx::query(
+        r#"
+        UPDATE sources SET source_type = $1, name = $2
+        WHERE id = $3
+        "#,
+    )
+    .bind(source_type_str)
+    .bind(format!("Test {} Source", source_type_str))
+    .bind("01JGF7V3E0Y2R1X8P5Q7W9T4N7")
+    .execute(pool)
+    .await?;
+
+    let creds_repo = ServiceCredentialsRepo::new(pool.clone())?;
+    let creds = ServiceCredential {
+        id: TEST_CRED_ID.to_string(),
+        source_id: "01JGF7V3E0Y2R1X8P5Q7W9T4N7".to_string(),
+        user_id: None,
+        provider: ServiceProvider::Atlassian,
+        auth_type: AuthType::ApiKey,
+        principal_email: None,
+        credentials: serde_json::json!({"sa_token": TEST_SA_TOKEN}),
+        config: serde_json::json!({"domain": TEST_DOMAIN}),
+        expires_at: None,
+        last_validated_at: None,
+        created_at: OffsetDateTime::now_utc(),
+        updated_at: OffsetDateTime::now_utc(),
+    };
+    creds_repo.create(creds).await?;
+
+    Ok(())
+}
+
+/// Count events in the connector_events_queue
+pub async fn count_queued_events(pool: &PgPool) -> Result<i64> {
+    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM connector_events_queue")
+        .fetch_one(pool)
+        .await?;
+    Ok(row.0)
+}
+
+/// Get all queued events with their payloads
+pub async fn get_queued_events(pool: &PgPool) -> Result<Vec<serde_json::Value>> {
+    let rows = sqlx::query_as::<_, (serde_json::Value,)>(
+        "SELECT payload FROM connector_events_queue ORDER BY created_at",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(p,)| p).collect())
+}
+
+/// Get queued events filtered by event type
+pub async fn get_queued_events_by_type(
+    pool: &PgPool,
+    event_type: &str,
+) -> Result<Vec<serde_json::Value>> {
+    let rows = sqlx::query_as::<_, (serde_json::Value,)>(
+        "SELECT payload FROM connector_events_queue WHERE event_type = $1 ORDER BY created_at",
+    )
+    .bind(event_type)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(p,)| p).collect())
+}

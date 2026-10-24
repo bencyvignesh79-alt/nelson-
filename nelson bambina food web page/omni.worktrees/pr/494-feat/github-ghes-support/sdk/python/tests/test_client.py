@@ -1,0 +1,363 @@
+import json
+
+import pytest
+from httpx import Response
+
+from omni_connector import (
+    connector_event,
+    DocumentMetadata,
+    DocumentPermissions,
+    EventType,
+)
+from omni_connector.exceptions import SdkClientError
+
+
+def test_sdk_config_can_be_shared_without_environment(monkeypatch):
+    from omni_connector import SdkConfig
+
+    monkeypatch.delenv("CONNECTOR_MANAGER_URL", raising=False)
+    config = SdkConfig(
+        connector_manager_url="http://manager:9000/",
+        connector_host_name="connector",
+        port=8123,
+        request_timeout=12.5,
+    )
+
+    from omni_connector import SdkClient
+
+    client = SdkClient(config=config)
+    assert client.base_url == "http://manager:9000"
+    assert client.config.connector_url == "http://connector:8123"
+    assert client.config.request_timeout == 12.5
+
+
+async def test_emit_event_sends_correct_payload(sdk_client, mock_connector_manager):
+    """Verify the exact JSON structure sent to connector-manager."""
+    event = connector_event(
+        type=EventType.DOCUMENT_CREATED,
+        sync_run_id="sync-123",
+        source_id="source-456",
+        document_id="doc-789",
+        content_id="content-abc",
+        metadata=DocumentMetadata(title="Test Doc", author="test@example.com"),
+        permissions=DocumentPermissions(public=True, users=["user1@example.com"]),
+        attributes={"category": "test"},
+    )
+
+    await sdk_client.emit_event("sync-123", "source-456", event)
+
+    # Verify the request was made
+    assert len(mock_connector_manager.calls) == 1
+    call = mock_connector_manager.calls[0]
+
+    # Verify URL
+    assert str(call.request.url) == "http://localhost:9000/sdk/events"
+
+    # Verify payload structure matches what Rust expects
+    payload = json.loads(call.request.content)
+    assert payload["sync_run_id"] == "sync-123"
+    assert payload["source_id"] == "source-456"
+
+    # Verify event structure (tagged enum format)
+    event_data = payload["event"]
+    assert event_data["type"] == "document_created"
+    assert event_data["sync_run_id"] == "sync-123"
+    assert event_data["source_id"] == "source-456"
+    assert event_data["document_id"] == "doc-789"
+    assert event_data["content_id"] == "content-abc"
+    assert event_data["metadata"]["title"] == "Test Doc"
+    assert event_data["metadata"]["author"] == "test@example.com"
+    assert event_data["permissions"]["public"] is True
+    assert event_data["permissions"]["users"] == ["user1@example.com"]
+    assert event_data["attributes"]["category"] == "test"
+
+
+@pytest.mark.asyncio
+async def test_emit_deleted_event_minimal_payload(sdk_client, mock_connector_manager):
+    """Deleted events should not include content_id, metadata, or permissions."""
+    event = connector_event(
+        type=EventType.DOCUMENT_DELETED,
+        sync_run_id="sync-123",
+        source_id="source-456",
+        document_id="doc-to-delete",
+    )
+
+    await sdk_client.emit_event("sync-123", "source-456", event)
+
+    payload = json.loads(mock_connector_manager.calls[0].request.content)
+    event_data = payload["event"]
+
+    assert event_data["type"] == "document_deleted"
+    assert event_data["document_id"] == "doc-to-delete"
+    # Deleted events should NOT have these fields
+    assert "content_id" not in event_data
+    assert "metadata" not in event_data
+    assert "permissions" not in event_data
+
+
+@pytest.mark.asyncio
+async def test_store_content_sends_correct_payload(sdk_client, mock_connector_manager):
+    """Verify content storage request format."""
+    content_id = await sdk_client.store_content(
+        "sync-123",
+        "This is the document content",
+        "text/html",
+    )
+
+    assert content_id == "test-content-id-123"
+
+    call = mock_connector_manager.calls[0]
+    assert str(call.request.url) == "http://localhost:9000/sdk/content"
+
+    payload = json.loads(call.request.content)
+    assert payload["sync_run_id"] == "sync-123"
+    assert payload["content"] == "This is the document content"
+    assert payload["content_type"] == "text/html"
+
+
+@pytest.mark.asyncio
+async def test_complete_saves_checkpoint_before_completion(
+    sdk_client, mock_connector_manager
+):
+    """Verify sync completion can save a final checkpoint first."""
+    await sdk_client.complete(
+        sync_run_id="sync-123",
+        documents_scanned=150,
+        documents_updated=42,
+        checkpoint={"cursor": "abc123", "page": 5},
+    )
+
+    checkpoint_call = mock_connector_manager.calls[0]
+    assert "/sdk/sync/sync-123/checkpoint" in str(checkpoint_call.request.url)
+    assert json.loads(checkpoint_call.request.content) == {
+        "cursor": "abc123",
+        "page": 5,
+    }
+
+    complete_call = mock_connector_manager.calls[1]
+    assert "/sdk/sync/sync-123/complete" in str(complete_call.request.url)
+
+    payload = json.loads(complete_call.request.content)
+    assert payload["documents_scanned"] == 150
+    assert payload["documents_updated"] == 42
+
+
+@pytest.mark.asyncio
+async def test_complete_without_checkpoint(sdk_client, mock_connector_manager):
+    """Verify completion works without a checkpoint."""
+    await sdk_client.complete(
+        sync_run_id="sync-123",
+        documents_scanned=10,
+        documents_updated=5,
+        checkpoint=None,
+    )
+
+    assert len(mock_connector_manager.calls) == 1
+    assert "/sdk/sync/sync-123/complete" in str(
+        mock_connector_manager.calls[0].request.url
+    )
+
+
+@pytest.mark.asyncio
+async def test_fail_sends_error_message(sdk_client, mock_connector_manager):
+    """Verify failure reports error correctly."""
+    await sdk_client.fail("sync-123", "Connection timeout after 30s")
+
+    call = mock_connector_manager.calls[0]
+    assert "/sdk/sync/sync-123/fail" in str(call.request.url)
+
+    payload = json.loads(call.request.content)
+    assert payload["error"] == "Connection timeout after 30s"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_uses_correct_url(sdk_client, mock_connector_manager):
+    """Verify heartbeat hits the right endpoint."""
+    await sdk_client.heartbeat("sync-run-abc")
+
+    call = mock_connector_manager.calls[0]
+    assert (
+        str(call.request.url) == "http://localhost:9000/sdk/sync/sync-run-abc/heartbeat"
+    )
+
+
+@pytest.mark.asyncio
+async def test_increment_scanned_uses_correct_url(sdk_client, mock_connector_manager):
+    """Verify scanned increment hits the right endpoint."""
+    await sdk_client.increment_scanned("sync-run-xyz")
+
+    call = mock_connector_manager.calls[0]
+    assert (
+        str(call.request.url) == "http://localhost:9000/sdk/sync/sync-run-xyz/scanned"
+    )
+
+
+@pytest.mark.asyncio
+async def test_emit_event_raises_on_server_error(mock_connector_manager, monkeypatch):
+    """Verify proper error handling on 500 response."""
+    monkeypatch.setenv("CONNECTOR_MANAGER_URL", "http://localhost:9000")
+
+    # Override the mock to return an error
+    mock_connector_manager.post("/sdk/events").mock(
+        return_value=Response(500, text="Internal Server Error")
+    )
+
+    from omni_connector import SdkClient
+
+    client = SdkClient.from_env()
+
+    event = connector_event(
+        type=EventType.DOCUMENT_CREATED,
+        sync_run_id="test",
+        source_id="test",
+        document_id="test",
+        content_id="test",
+    )
+
+    with pytest.raises(SdkClientError) as exc_info:
+        await client.emit_event("test", "test", event)
+
+    assert "500" in str(exc_info.value)
+    assert "Internal Server Error" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_store_content_raises_on_error(mock_connector_manager, monkeypatch):
+    """Verify proper error handling when content storage fails."""
+    monkeypatch.setenv("CONNECTOR_MANAGER_URL", "http://localhost:9000")
+
+    mock_connector_manager.post("/sdk/content").mock(
+        return_value=Response(413, text="Content too large")
+    )
+
+    from omni_connector import SdkClient
+
+    client = SdkClient.from_env()
+
+    with pytest.raises(SdkClientError) as exc_info:
+        await client.store_content("sync-123", "x" * 1000000, "text/plain")
+
+    assert "413" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_fetch_source_sync_data_returns_typed_model(
+    sdk_client, mock_connector_manager
+):
+    """Verify fetch_source_sync_data calls the right endpoint and returns SdkSourceSyncData."""
+    from omni_connector import SdkSourceSyncData, UserFilterMode
+
+    mock_connector_manager.get("/sdk/source/source-123/sync-config").mock(
+        return_value=Response(
+            200,
+            json={
+                "config": {"folder_id": "abc"},
+                "credentials": {"access_token": "token"},
+                "connector_state": {"webhook": "meta"},
+                "checkpoint": {"cursor": "xyz"},
+                "source_type": "one_drive",
+                "user_filter_mode": "whitelist",
+                "user_whitelist": ["alice@example.com"],
+                "user_blacklist": None,
+            },
+        )
+    )
+
+    result = await sdk_client.fetch_source_sync_data("source-123")
+
+    assert isinstance(result, SdkSourceSyncData)
+    assert result.config == {"folder_id": "abc"}
+    assert result.credentials == {"access_token": "token"}
+    assert result.connector_state == {"webhook": "meta"}
+    assert result.checkpoint == {"cursor": "xyz"}
+    assert result.source_type == "one_drive"
+    assert result.user_filter_mode == UserFilterMode.WHITELIST
+    assert result.user_whitelist == ["alice@example.com"]
+    assert result.user_blacklist is None
+
+    call = mock_connector_manager.calls[-1]
+    assert (
+        str(call.request.url)
+        == "http://localhost:9000/sdk/source/source-123/sync-config"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fetch_source_sync_data_defaults_filter_to_all(
+    sdk_client, mock_connector_manager
+):
+    """Verify missing filter fields default safely to ALL."""
+    from omni_connector import UserFilterMode
+
+    mock_connector_manager.get("/sdk/source/source-123/sync-config").mock(
+        return_value=Response(
+            200,
+            json={
+                "config": {},
+                "credentials": {},
+            },
+        )
+    )
+
+    result = await sdk_client.fetch_source_sync_data("source-123")
+    assert result.user_filter_mode == UserFilterMode.ALL
+    assert result.user_whitelist is None
+    assert result.user_blacklist is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_source_sync_data_raises_on_404(
+    mock_connector_manager, monkeypatch
+):
+    """Verify proper error handling when source is not found."""
+    monkeypatch.setenv("CONNECTOR_MANAGER_URL", "http://localhost:9000")
+
+    mock_connector_manager.get(path__regex=r"/sdk/source/.*/sync-config").mock(
+        return_value=Response(404, text="Source not found")
+    )
+
+    from omni_connector import SdkClient
+
+    client = SdkClient.from_env()
+
+    with pytest.raises(SdkClientError) as exc_info:
+        await client.fetch_source_sync_data("nonexistent-source")
+
+    assert "404" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_fetch_source_sync_data_raises_on_invalid_response(
+    sdk_client, mock_connector_manager
+):
+    """Verify deserialization failure raises SdkClientError."""
+    mock_connector_manager.get("/sdk/source/source-123/sync-config").mock(
+        return_value=Response(
+            200,
+            json={"unexpected": "shape"},
+        )
+    )
+
+    with pytest.raises(SdkClientError, match="Invalid source sync data"):
+        await sdk_client.fetch_source_sync_data("source-123")
+
+
+def test_client_requires_url(monkeypatch):
+    """Verify client fails fast without CONNECTOR_MANAGER_URL."""
+    monkeypatch.delenv("CONNECTOR_MANAGER_URL", raising=False)
+
+    from omni_connector import SdkClient
+
+    with pytest.raises(ValueError, match="CONNECTOR_MANAGER_URL"):
+        SdkClient.from_env()
+
+
+def test_client_strips_trailing_slash(monkeypatch):
+    """Verify base URL normalization."""
+    monkeypatch.setenv("CONNECTOR_MANAGER_URL", "http://localhost:9000/")
+
+    from omni_connector import SdkClient
+
+    client = SdkClient.from_env()
+
+    assert client.base_url == "http://localhost:9000"

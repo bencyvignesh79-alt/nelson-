@@ -1,0 +1,451 @@
+import express, { type Express, type Request, type Response } from "express";
+
+import { SdkClient } from "./client.js";
+import type { Connector } from "./connector.js";
+import { SyncContext } from "./context.js";
+import {
+  SyncMode,
+  SyncRequestSchema,
+  CancelRequestSchema,
+  ActionRequestSchema,
+  OAuthCredentialReadyRequestSchema,
+  OAuthCredentialValidationRequestSchema,
+  ResourceRequestSchema,
+  PromptRequestSchema,
+  createSyncResponseStarted,
+  createSyncResponseError,
+  ActionResponse,
+  type ConnectorManifest,
+  type OAuthCredentialValidationResponse,
+  type SdkSourceSyncData,
+} from "./models.js";
+import { getLogger } from "./logger.js";
+import { MCP_AUTH_REQUIRED_MESSAGE } from "./mcp-adapter.js";
+
+const logger = getLogger("sdk:server");
+
+const REGISTRATION_INTERVAL_MS = 30_000;
+type SyncSlotClass = "realtime" | "scheduled";
+
+function syncSlotClass(syncMode: SyncMode): SyncSlotClass {
+  return syncMode === SyncMode.REALTIME ? "realtime" : "scheduled";
+}
+
+function buildConnectorUrl(): string {
+  const hostname = process.env.CONNECTOR_HOST_NAME;
+  if (!hostname) {
+    throw new Error(
+      "CONNECTOR_HOST_NAME environment variable is required. " +
+        "Set it to this connector's hostname (e.g. the Docker service name).",
+    );
+  }
+  const port = process.env.PORT;
+  if (!port) {
+    throw new Error("PORT environment variable is required.");
+  }
+  return `http://${hostname}:${port}`;
+}
+
+export function createServer(connector: Connector): Express {
+  const app = express();
+  app.use(express.json());
+
+  // Realtime watchers and scheduled scans occupy independent slots per source.
+  const activeSyncs = new Map<string, Map<SyncSlotClass, SyncContext>>();
+  let sdkClient: SdkClient | null = null;
+
+  function getSdkClient(): SdkClient {
+    if (sdkClient === null) {
+      sdkClient = SdkClient.fromEnv();
+    }
+    return sdkClient;
+  }
+
+  // Start registration loop
+  const connectorUrl = buildConnectorUrl();
+  const registerOnce = async () => {
+    try {
+      const manifest = await connector.getManifest(connectorUrl);
+      await getSdkClient().register(manifest);
+      logger.info("Registered with connector manager");
+    } catch (err) {
+      logger.warn({ err }, "Registration failed");
+    }
+  };
+
+  registerOnce();
+  setInterval(registerOnce, REGISTRATION_INTERVAL_MS);
+
+  app.get("/health", (_req: Request, res: Response) => {
+    res.json({ status: "healthy", service: connector.name });
+  });
+
+  app.get("/manifest", async (_req: Request, res: Response) => {
+    const manifest = await connector.getManifest(connectorUrl);
+    res.json(manifest);
+  });
+
+  app.post("/oauth/validate", async (req: Request, res: Response) => {
+    const parseResult = OAuthCredentialValidationRequestSchema.safeParse(req.body);
+    if (!parseResult.success) {
+      res.status(400).json({ error: "Invalid request body" });
+      return;
+    }
+    if (!parseResult.data.source) {
+      res.status(400).json({ error: "source is required for OAuth validation" });
+      return;
+    }
+
+    try {
+      const binding = await connector.validateOauthCredential(parseResult.data);
+      res.json({ source_binding: binding } satisfies OAuthCredentialValidationResponse);
+    } catch (err) {
+      logger.warn({ err }, "OAuth credential validation failed");
+      res.status(400).json({ error: String(err) });
+    }
+  });
+
+  app.post("/oauth/credential-ready", async (req: Request, res: Response) => {
+    const parseResult = OAuthCredentialReadyRequestSchema.safeParse(req.body);
+    if (!parseResult.success) {
+      res.status(400).json({ error: "Invalid request body" });
+      return;
+    }
+
+    const changed = await connector.oauthCredentialReady(parseResult.data);
+    if (!changed) {
+      res.status(204).send();
+      return;
+    }
+
+    const manifest = await connector.getManifest(connectorUrl);
+    try {
+      await getSdkClient().register(manifest);
+    } catch (err) {
+      logger.warn({ err }, "OAuth credential-ready manifest registration failed");
+    }
+    res.json(manifest);
+  });
+
+  app.get("/sync/:syncRunId", (req: Request, res: Response) => {
+    const { syncRunId } = req.params;
+    let running = false;
+    for (const slots of activeSyncs.values()) {
+      for (const ctx of slots.values()) {
+        if (ctx.syncRunId === syncRunId) {
+          running = true;
+          break;
+        }
+      }
+      if (running) break;
+    }
+    res.json({ running });
+  });
+
+  app.post("/sync", async (req: Request, res: Response) => {
+    const parseResult = SyncRequestSchema.safeParse(req.body);
+    if (!parseResult.success) {
+      res.status(400).json(createSyncResponseError("Invalid request body"));
+      return;
+    }
+
+    const {
+      sync_run_id: syncRunId,
+      source_id: sourceId,
+      sync_mode: syncModeStr,
+      documents_scanned: documentsScanned,
+      documents_updated: documentsUpdated,
+      checkpoint: requestCheckpoint,
+      is_resume: isResume,
+    } = parseResult.data;
+
+    const isValidSyncMode = (Object.values(SyncMode) as string[]).includes(
+      syncModeStr,
+    );
+    if (!isValidSyncMode) {
+      logger.warn(
+        `Unknown sync_mode '${syncModeStr}'; defaulting to Incremental batching`,
+      );
+    }
+    const syncMode: SyncMode = isValidSyncMode
+      ? (syncModeStr as SyncMode)
+      : SyncMode.INCREMENTAL;
+
+    logger.info(
+      `Sync triggered for source ${sourceId} (sync_run_id: ${syncRunId})`,
+    );
+
+    const slotClass = syncSlotClass(syncMode);
+    if (activeSyncs.get(sourceId)?.has(slotClass)) {
+      res
+        .status(409)
+        .json(
+          createSyncResponseError("Sync already in progress for this source"),
+        );
+      return;
+    }
+
+    let sourceData: SdkSourceSyncData;
+    try {
+      sourceData = await getSdkClient().fetchSourceConfig(sourceId);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes("404")) {
+        res
+          .status(404)
+          .json(createSyncResponseError(`Source not found: ${sourceId}`));
+      } else {
+        logger.error({ err: error }, "Failed to fetch source data");
+        res
+          .status(500)
+          .json(
+            createSyncResponseError(`Failed to fetch source data: ${message}`),
+          );
+      }
+      return;
+    }
+
+    const ctx = new SyncContext(
+      getSdkClient(),
+      syncRunId,
+      sourceId,
+      requestCheckpoint ?? sourceData.checkpoint ?? undefined,
+      syncMode,
+      documentsScanned,
+      documentsUpdated,
+      {
+        isResume,
+        sourceType: sourceData.source_type,
+        userFilterMode: sourceData.user_filter_mode,
+        userWhitelist: sourceData.user_whitelist,
+        userBlacklist: sourceData.user_blacklist,
+      },
+    );
+    let sourceSlots = activeSyncs.get(sourceId);
+    if (!sourceSlots) {
+      sourceSlots = new Map();
+      activeSyncs.set(sourceId, sourceSlots);
+    }
+    sourceSlots.set(slotClass, ctx);
+
+    const runSync = async (): Promise<void> => {
+      try {
+        await connector.sync(
+          sourceData.config,
+          sourceData.credentials,
+          requestCheckpoint ?? sourceData.checkpoint,
+          ctx,
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        logger.error({ err: error }, `Sync ${syncRunId} failed`);
+        if (!ctx.isCancelled()) {
+          try {
+            await ctx.fail(message);
+          } catch (failError) {
+            logger.error({ err: failError }, "Failed to report sync failure");
+          }
+        }
+      } finally {
+        const currentSlots = activeSyncs.get(sourceId);
+        if (currentSlots?.get(slotClass) === ctx) {
+          currentSlots.delete(slotClass);
+          if (currentSlots.size === 0) {
+            activeSyncs.delete(sourceId);
+          }
+        }
+      }
+    };
+
+    runSync();
+
+    res.status(200).json(createSyncResponseStarted());
+  });
+
+  app.post("/cancel", (req: Request, res: Response) => {
+    const parseResult = CancelRequestSchema.safeParse(req.body);
+    if (!parseResult.success) {
+      res
+        .status(400)
+        .json({ status: "error", message: "Invalid request body" });
+      return;
+    }
+
+    const { sync_run_id: syncRunId } = parseResult.data;
+    logger.info(`Cancel requested for sync ${syncRunId}`);
+
+    let matchingSourceId: string | null = null;
+    let matchingSlotClass: SyncSlotClass | null = null;
+    let matchingCtx: SyncContext | null = null;
+    for (const [sourceId, slots] of activeSyncs.entries()) {
+      for (const [slotClass, ctx] of slots.entries()) {
+        if (ctx.syncRunId === syncRunId) {
+          matchingSourceId = sourceId;
+          matchingSlotClass = slotClass;
+          matchingCtx = ctx;
+          break;
+        }
+      }
+      if (matchingCtx !== null) break;
+    }
+
+    if (
+      matchingSourceId === null ||
+      matchingSlotClass === null ||
+      matchingCtx === null
+    ) {
+      res.status(404).json({ status: "not_found" });
+      return;
+    }
+
+    matchingCtx._setCancelled();
+    const matchingSlots = activeSyncs.get(matchingSourceId);
+    matchingSlots?.delete(matchingSlotClass);
+    if (matchingSlots?.size === 0) {
+      activeSyncs.delete(matchingSourceId);
+    }
+    connector.cancel(syncRunId);
+    res.json({ status: "cancelled" });
+  });
+
+  app.post("/action", async (req: Request, res: Response) => {
+    const parseResult = ActionRequestSchema.safeParse(req.body);
+    if (!parseResult.success) {
+      const errorResp = ActionResponse.failure("Invalid request body");
+      res.status(400).json(errorResp);
+      return;
+    }
+
+    const { action, credentials, source, actor_email } = parseResult.data;
+    const params = { ...parseResult.data.params };
+    logger.info(`Action requested: ${action}`);
+
+    const result = await connector.executeAction(
+      action,
+      params,
+      credentials ?? {},
+      source,
+      actor_email,
+    );
+
+    if (result instanceof globalThis.Response) {
+      res.status(result.status);
+      result.headers.forEach((value, key) => res.setHeader(key, value));
+      const bodyBuffer = Buffer.from(await result.arrayBuffer());
+      res.send(bodyBuffer);
+      return;
+    }
+
+    // Fallback for unexpected return types (should not happen)
+    res
+      .status(500)
+      .json(ActionResponse.failure("Unexpected action result type"));
+  });
+
+  // Stable 412 "needs_user_auth" response for terminal MCP authentication
+  // failures on resource/prompt requests. Mirrors the Python SDK so
+  // connector-manager invalidates the acting user's credential and the web
+  // layer surfaces the same reconnect CTA.
+  function needsUserAuthResponse(
+    message: string,
+    credentials: Record<string, unknown>
+  ): globalThis.Response | null {
+    if (
+      message !== MCP_AUTH_REQUIRED_MESSAGE &&
+      !connector.mcpAuthenticationError(message)
+    ) {
+      return null;
+    }
+    const sourceId =
+      typeof credentials.source_id === "string" ? credentials.source_id : undefined;
+    const sourceType = connector.sourceTypes[0];
+    if (!sourceId || !sourceType) {
+      return null;
+    }
+    return new globalThis.Response(
+      JSON.stringify({
+        error: "needs_user_auth",
+        source_id: sourceId,
+        source_type: sourceType,
+        provider: connector.oauthConfig?.provider ?? null,
+        oauth_start_url: `/api/oauth/start?source_id=${sourceId}`,
+      }),
+      { status: 412, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  app.post("/resource", async (req: Request, res: Response) => {
+    const adapter = await connector.getMcpAdapter();
+    if (!adapter) {
+      res.status(404).json({ error: "MCP not enabled for this connector" });
+      return;
+    }
+
+    const parseResult = ResourceRequestSchema.safeParse(req.body);
+    if (!parseResult.success) {
+      res.status(400).json({ error: "Invalid request body" });
+      return;
+    }
+
+    const { uri, credentials } = parseResult.data;
+    logger.info(`Resource requested: ${uri}`);
+
+    try {
+      const { env, headers } = connector.prepareMcpAuth(credentials);
+      const result = await adapter.readResource(uri, env, headers);
+      res.json(result);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const authResponse = needsUserAuthResponse(message, credentials);
+      if (authResponse) {
+        res.status(authResponse.status);
+        authResponse.headers.forEach((value, key) => res.setHeader(key, value));
+        res.send(Buffer.from(await authResponse.arrayBuffer()));
+        return;
+      }
+      logger.error({ err }, `Resource read failed for ${uri}`);
+      res.status(500).json({ error: message });
+    }
+  });
+
+  app.post("/prompt", async (req: Request, res: Response) => {
+    const adapter = await connector.getMcpAdapter();
+    if (!adapter) {
+      res.status(404).json({ error: "MCP not enabled for this connector" });
+      return;
+    }
+
+    const parseResult = PromptRequestSchema.safeParse(req.body);
+    if (!parseResult.success) {
+      res.status(400).json({ error: "Invalid request body" });
+      return;
+    }
+
+    const { name, arguments: args, credentials } = parseResult.data;
+    logger.info(`Prompt requested: ${name}`);
+
+    try {
+      const { env, headers } = connector.prepareMcpAuth(credentials);
+      const result = await adapter.getPrompt(
+        name,
+        args as Record<string, string> | undefined,
+        env,
+        headers,
+      );
+      res.json(result);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const authResponse = needsUserAuthResponse(message, credentials);
+      if (authResponse) {
+        res.status(authResponse.status);
+        authResponse.headers.forEach((value, key) => res.setHeader(key, value));
+        res.send(Buffer.from(await authResponse.arrayBuffer()));
+        return;
+      }
+      logger.error({ err }, `Prompt get failed for ${name}`);
+      res.status(500).json({ error: message });
+    }
+  });
+
+  return app;
+}

@@ -1,0 +1,86 @@
+[workspace]
+members = [
+    "sdk/rust",
+    "services/searcher",
+    "services/indexer",
+    "services/connector-manager",
+    "services/sandbox",
+    "connectors/google",
+    "connectors/slack",
+    "connectors/atlassian",
+    "connectors/filesystem",
+    "connectors/fireflies",
+    "connectors/web",
+    "connectors/imap",
+    "connectors/nextcloud",
+    "connectors/darwinbox",
+    "shared",
+    "benchmarks",
+    "cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Omni Contributors"]
+license = "Apache-2.0"
+repository = "https://github.com/getomnico/omni"
+
+[workspace.dependencies]
+tokio = { version = "1.40", features = ["full"] }
+axum = { version = "0.7", features = ["ws", "multipart"] }
+tower = { version = "0.5", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-full"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "json", "time", "uuid"] }
+pgvector = { version = "=0.4.1", features = ["sqlx"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_path_to_error = "0.1"
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream", "multipart"] }
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+thiserror = "1.0"
+anyhow = "1.0"
+time = { version = "0.3", features = ["serde", "formatting", "serde-well-known"] }
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+uuid = { version = "1.11", features = ["v4", "serde"] }
+ulid = { version = "1.1", features = ["serde"] }
+dotenvy = "0.15"
+async-trait = "0.1"
+governor = "0.6"
+futures = "0.3"
+nonzero_ext = "0.3"
+rand = "0.8"
+url = "2.5"
+dashmap = "6.1.0"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+tokio-util = "0.7"
+futures-util = "0.3"
+
+# OpenTelemetry dependencies
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", features = ["http-proto", "reqwest-client", "trace", "metrics"] }
+opentelemetry-semantic-conventions = "0.32"
+tracing-opentelemetry = "0.33"
+opentelemetry-http = "0.32"
+
+# Test dependencies
+testcontainers = { version = "0.21", features = ["watchdog"] }
+testcontainers-modules = { version = "0.9", features = ["postgres", "redis", "localstack"] }
+axum-test = "15.3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 0
+
+[profile.dev.package."*"]
+opt-level = 3

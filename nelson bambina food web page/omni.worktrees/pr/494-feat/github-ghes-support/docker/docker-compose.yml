@@ -1,0 +1,946 @@
+x-db-config: &db-config
+  DATABASE_HOST: ${DATABASE_HOST}
+  DATABASE_PORT: ${DATABASE_PORT}
+  DATABASE_USERNAME: ${DATABASE_USERNAME}
+  DATABASE_PASSWORD: ${DATABASE_PASSWORD}
+  DATABASE_NAME: ${DATABASE_NAME}
+
+x-db-pool-config: &db-pool-config
+  DB_MAX_CONNECTIONS: ${DB_MAX_CONNECTIONS:-10}
+  DB_ACQUIRE_TIMEOUT_SECONDS: ${DB_ACQUIRE_TIMEOUT_SECONDS:-3}
+
+x-redis-config: &redis-config
+  REDIS_URL: ${REDIS_URL}
+
+x-otel-config: &otel-config
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT}
+  OTEL_DEPLOYMENT_ID: ${OTEL_DEPLOYMENT_ID}
+  OTEL_DEPLOYMENT_ENVIRONMENT: ${OTEL_DEPLOYMENT_ENVIRONMENT:-development}
+  SERVICE_VERSION: ${SERVICE_VERSION:-0.1.0}
+
+x-storage-config: &storage-config
+  STORAGE_BACKEND: ${STORAGE_BACKEND}
+  # Only required if STORAGE_BACKEND=s3
+  S3_BUCKET: ${S3_BUCKET}
+  S3_REGION: ${S3_REGION}
+
+x-docling-config: &docling-config
+  DOCLING_URL: ${DOCLING_URL:-http://docling:8003}
+
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "100m"
+    max-file: "10"
+    compress: "true"
+
+x-resources-critical: &resources-critical
+  cpu_shares: ${OMNI_CPU_SHARES_CRITICAL:-2048}
+
+x-resources-high: &resources-high
+  cpu_shares: ${OMNI_CPU_SHARES_HIGH:-1024}
+
+x-resources-normal: &resources-normal
+  cpu_shares: ${OMNI_CPU_SHARES_NORMAL:-512}
+
+x-resources-background: &resources-background
+  cpu_shares: ${OMNI_CPU_SHARES_BACKGROUND:-256}
+
+x-resources-connector: &resources-connector
+  cpu_shares: ${OMNI_CPU_SHARES_CONNECTOR:-128}
+
+services:
+  postgres:
+    image: paradedb/paradedb:0.24.0-pg17
+    <<: *resources-critical
+    cpus: ${OMNI_POSTGRES_CPUS:-1.0}
+    mem_limit: ${OMNI_POSTGRES_MEMORY:-3g}
+    shm_size: ${OMNI_POSTGRES_SHM_SIZE:-2g}
+    container_name: omni-postgres
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=1GB"
+      - "-c"
+      - "max_parallel_workers_per_gather=2"
+      - "-c"
+      - "max_parallel_workers=4"
+      - "-c"
+      - "max_parallel_maintenance_workers=2"
+      - "-c"
+      - "max_worker_processes=8"
+    environment:
+      POSTGRES_DB: ${DATABASE_NAME}
+      POSTGRES_USER: ${DATABASE_USERNAME}
+      POSTGRES_PASSWORD: ${DATABASE_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - omni-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DATABASE_USERNAME} -d ${DATABASE_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging: *default-logging
+
+  redis:
+    image: redis:7-alpine
+    <<: *resources-normal
+    cpus: ${OMNI_REDIS_CPUS:-0.2}
+    mem_limit: ${OMNI_REDIS_MEMORY:-256m}
+    container_name: omni-redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    networks:
+      - omni-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging: *default-logging
+
+  migrator:
+    image: ghcr.io/getomnico/omni/omni-migrator:${OMNI_VERSION:-latest}
+    <<: *resources-background
+    cpus: ${OMNI_MIGRATOR_CPUS:-0.25}
+    mem_limit: ${OMNI_MIGRATOR_MEMORY:-256m}
+    container_name: omni-migrator
+    environment:
+      <<: *db-config
+    networks:
+      - omni-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    logging: *default-logging
+
+  # Core Services
+  searcher:
+    image: ghcr.io/getomnico/omni/omni-searcher:${OMNI_VERSION:-latest}
+    <<: *resources-high
+    cpus: ${OMNI_SEARCHER_CPUS:-0.5}
+    mem_limit: ${OMNI_SEARCHER_MEMORY:-512m}
+    container_name: omni-searcher
+    expose:
+      - "${SEARCHER_PORT}"
+    environment:
+      <<: [*db-config, *db-pool-config, *redis-config, *otel-config, *storage-config]
+      RUST_LOG: ${RUST_LOG}
+      PORT: ${SEARCHER_PORT}
+      AI_SERVICE_URL: ${AI_SERVICE_URL}
+      SEMANTIC_SEARCH_TIMEOUT_MS: ${SEMANTIC_SEARCH_TIMEOUT_MS}
+    networks:
+      - omni-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    logging: *default-logging
+
+  indexer:
+    image: ghcr.io/getomnico/omni/omni-indexer:${OMNI_VERSION:-latest}
+    <<: *resources-background
+    cpus: ${OMNI_INDEXER_CPUS:-0.25}
+    mem_limit: ${OMNI_INDEXER_MEMORY:-512m}
+    container_name: omni-indexer
+    expose:
+      - "${INDEXER_PORT}"
+    environment:
+      <<: [*db-config, *db-pool-config, *redis-config, *otel-config, *storage-config]
+      RUST_LOG: ${RUST_LOG}
+      PORT: ${INDEXER_PORT}
+      AI_SERVICE_URL: ${AI_SERVICE_URL}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      ENCRYPTION_SALT: ${ENCRYPTION_SALT}
+    networks:
+      - omni-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    logging: *default-logging
+
+  ai:
+    image: ghcr.io/getomnico/omni/omni-ai:${OMNI_VERSION:-latest}
+    <<: *resources-high
+    cpus: ${OMNI_AI_CPUS:-0.75}
+    mem_limit: ${OMNI_AI_MEMORY:-1g}
+    container_name: omni-ai
+    expose:
+      - "${AI_SERVICE_PORT}"
+    environment:
+      <<: [*db-config, *db-pool-config, *redis-config, *otel-config, *storage-config]
+      # Service configuration
+      PORT: ${AI_SERVICE_PORT}
+      MODEL_PATH: ${MODEL_PATH}
+      AI_WORKERS: ${AI_WORKERS:-1}
+      CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-0}
+      SEARCHER_URL: ${SEARCHER_URL}
+      AWS_REGION: ${AWS_REGION:-}
+      CONNECTOR_MANAGER_URL: ${CONNECTOR_MANAGER_URL}
+      SANDBOX_URL: ${SANDBOX_URL:-}
+      MEMORY_ENABLED: ${MEMORY_ENABLED:-false}
+      MEMORY_PROVIDER: ${MEMORY_PROVIDER:-mem0}
+      AGENT_MAX_ITERATIONS: ${AGENT_MAX_ITERATIONS:-15}
+      APPROVAL_TIMEOUT_SECONDS: ${APPROVAL_TIMEOUT_SECONDS:-600}
+      AGENTS_ENABLED: ${AGENTS_ENABLED:-false}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      ENCRYPTION_SALT: ${ENCRYPTION_SALT}
+    networks:
+      - omni-network
+      - sandbox-net
+    volumes:
+      - ai_models:/models
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    logging: *default-logging
+
+  # Sandbox - Isolated code execution for the AI agent.
+  # Runs on sandbox-net only (no access to omni-network / internal services).
+  # The AI service bridges both networks to reach it.
+  sandbox:
+    image: ghcr.io/getomnico/omni/omni-sandbox:${OMNI_VERSION:-latest}
+    <<: *resources-background
+    cpus: ${OMNI_SANDBOX_CPUS:-0.5}
+    mem_limit: ${OMNI_SANDBOX_MEMORY:-512m}
+    container_name: omni-sandbox
+    expose:
+      - "${SANDBOX_PORT}"
+    environment:
+      PORT: ${SANDBOX_PORT}
+      SCRATCH_DIR: /scratch
+      EXECUTION_TIMEOUT: "30"
+      SANDBOX_ENABLED: "true"
+    volumes:
+      - sandbox_data:/scratch
+    networks:
+      - sandbox-net
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    depends_on:
+      ai:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${SANDBOX_PORT}/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    logging: *default-logging
+
+  # Connector Manager - Orchestrates all connectors
+  connector-manager:
+    image: ghcr.io/getomnico/omni/omni-connector-manager:${OMNI_VERSION:-latest}
+    <<: *resources-normal
+    cpus: ${OMNI_CONNECTOR_MANAGER_CPUS:-0.5}
+    mem_limit: ${OMNI_CONNECTOR_MANAGER_MEMORY:-3g}
+    container_name: omni-connector-manager
+    expose:
+      - "${CONNECTOR_MANAGER_PORT}"
+    environment:
+      <<: [*db-config, *db-pool-config, *redis-config, *otel-config, *docling-config]
+      RUST_LOG: ${RUST_LOG}
+      PORT: ${CONNECTOR_MANAGER_PORT}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      ENCRYPTION_SALT: ${ENCRYPTION_SALT}
+      MAX_CONCURRENT_SYNCS: ${MAX_CONCURRENT_SYNCS:-10}
+      MAX_CONCURRENT_SYNCS_PER_TYPE: ${MAX_CONCURRENT_SYNCS_PER_TYPE:-3}
+      EXTRACTION_CONCURRENCY: ${EXTRACTION_CONCURRENCY:-2}
+      EXTRACTION_RETRY_AFTER_SECONDS: ${EXTRACTION_RETRY_AFTER_SECONDS:-30}
+      CONNECTOR_MANAGER_MAX_EXTRACT_INPUT_BYTES: ${CONNECTOR_MANAGER_MAX_EXTRACT_INPUT_BYTES:-52428800}
+      CONNECTOR_MANAGER_MAX_EXTRACTED_TEXT_BYTES: ${CONNECTOR_MANAGER_MAX_EXTRACTED_TEXT_BYTES:-5242880}
+      CONNECTOR_MANAGER_SPREADSHEET_MAX_INDEXED_ROWS: ${CONNECTOR_MANAGER_SPREADSHEET_MAX_INDEXED_ROWS:-1000}
+      SCHEDULER_POLL_INTERVAL_SECONDS: ${SCHEDULER_POLL_INTERVAL_SECONDS:-60}
+      STALE_SYNC_TIMEOUT_MINUTES: ${STALE_SYNC_TIMEOUT_MINUTES:-10}
+    networks:
+      - omni-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    logging: *default-logging
+
+  # HuggingFace TEI Embeddings Service (for local embedding models)
+  # GPU support: use docker-compose.gpu.yml override for GPU acceleration
+  embeddings:
+    image: ghcr.io/huggingface/text-embeddings-inference:1.8
+    <<: *resources-background
+    cpus: ${OMNI_EMBEDDINGS_CPUS:-0.75}
+    mem_limit: ${OMNI_EMBEDDINGS_MEMORY:-2g}
+    container_name: omni-embeddings
+    expose:
+      - "${LOCAL_EMBEDDINGS_PORT}"
+    command:
+      - "--model-id"
+      - "${EMBEDDING_MODEL:-BAAI/bge-small-en-v1.5}"
+      - "--port"
+      - "${LOCAL_EMBEDDINGS_PORT}"
+    networks:
+      - omni-network
+    volumes:
+      - tei_models:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${LOCAL_EMBEDDINGS_PORT}/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    profiles:
+      - local-embeddings  # Only start when local-embeddings profile is active
+    logging: *default-logging
+
+  # Docling Service - AI-based document to Markdown conversion
+  # Provides superior PDF extraction, OCR, and structure-aware output
+  # Opt-in: set DOCLING_ENABLED=true in .env to deploy (activates the `docling`
+  # compose profile). Then enable at runtime via the admin UI at
+  # /admin/settings/document-conversion.
+  # Default image is CPU-only (~1.5 GB). For GPU, set DOCLING_DEVICE=cuda in .env
+  # to use the -cuda tagged image. You must also have the NVIDIA Container Toolkit
+  # installed and uncomment the deploy.resources.reservations block below.
+  docling:
+    image: ghcr.io/getomnico/omni/omni-docling:${OMNI_VERSION:-latest}${DOCLING_DEVICE:+-${DOCLING_DEVICE}}
+    <<: *resources-background
+    cpus: ${DOCLING_CPUS:-0.75}
+    container_name: omni-docling
+    profiles:
+      - docling
+    environment:
+      PORT: ${DOCLING_PORT:-8003}
+      MAX_CONCURRENT_CONVERSIONS: ${DOCLING_MAX_CONCURRENT_CONVERSIONS:-1}
+    networks:
+      - omni-network
+    volumes:
+      - docling_models:/root/.cache
+    restart: unless-stopped
+    mem_limit: ${DOCLING_MEMORY:-2g}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${DOCLING_PORT:-8003}/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s  # Models take time to load on first start
+    # For GPU: uncomment to reserve an NVIDIA device.
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    logging: *default-logging
+
+  # Connector Services
+  google-connector:
+    image: ghcr.io/getomnico/omni/omni-google-connector:${OMNI_VERSION:-latest}
+    <<: *resources-connector
+    cpus: ${OMNI_CONNECTOR_CPUS:-0.2}
+    mem_limit: ${OMNI_CONNECTOR_MEMORY:-384m}
+    container_name: omni-google-connector
+    profiles:
+      - google
+    expose:
+      - "${GOOGLE_CONNECTOR_PORT}"
+    environment:
+      <<: [*redis-config, *otel-config]
+      RUST_LOG: ${RUST_LOG}
+      PORT: ${GOOGLE_CONNECTOR_PORT}
+      CONNECTOR_MANAGER_URL: ${CONNECTOR_MANAGER_URL}
+      CONNECTOR_HOST_NAME: google-connector
+      GOOGLE_MAX_AGE_DAYS: ${GOOGLE_MAX_AGE_DAYS:-730}
+      GOOGLE_DRIVE_MAX_DOWNLOAD_BYTES: ${GOOGLE_DRIVE_MAX_DOWNLOAD_BYTES:-52428800}
+      GOOGLE_SHEETS_MAX_INDEXED_ROWS: ${GOOGLE_SHEETS_MAX_INDEXED_ROWS:-1000}
+      GOOGLE_DRIVE_PARALLEL_USERS: ${GOOGLE_DRIVE_PARALLEL_USERS:-3}
+      GOOGLE_WEBHOOK_DEBOUNCE_SECONDS: ${GOOGLE_WEBHOOK_DEBOUNCE_SECONDS:-14400}
+      OMNI_DOMAIN: ${OMNI_DOMAIN}
+      WEBHOOK_RENEWAL_CHECK_INTERVAL_SECONDS: ${WEBHOOK_RENEWAL_CHECK_INTERVAL_SECONDS:-3600}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      ENCRYPTION_SALT: ${ENCRYPTION_SALT}
+    networks:
+      - omni-network
+    depends_on:
+      redis:
+        condition: service_healthy
+      connector-manager:
+        condition: service_started
+    restart: unless-stopped
+    logging: *default-logging
+
+  slack-connector:
+    image: ghcr.io/getomnico/omni/omni-slack-connector:${OMNI_VERSION:-latest}
+    <<: *resources-connector
+    cpus: ${OMNI_CONNECTOR_CPUS:-0.2}
+    mem_limit: ${OMNI_CONNECTOR_MEMORY:-384m}
+    container_name: omni-slack-connector
+    profiles:
+      - slack
+    expose:
+      - "${SLACK_CONNECTOR_PORT}"
+    environment:
+      <<: *otel-config
+      RUST_LOG: ${RUST_LOG}
+      PORT: ${SLACK_CONNECTOR_PORT}
+      CONNECTOR_MANAGER_URL: ${CONNECTOR_MANAGER_URL}
+      CONNECTOR_HOST_NAME: slack-connector
+      SLACK_MAX_AGE_DAYS: ${SLACK_MAX_AGE_DAYS:-730}
+    networks:
+      - omni-network
+    depends_on:
+      connector-manager:
+        condition: service_started
+    restart: unless-stopped
+    logging: *default-logging
+
+  atlassian-connector:
+    image: ghcr.io/getomnico/omni/omni-atlassian-connector:${OMNI_VERSION:-latest}
+    <<: *resources-connector
+    cpus: ${OMNI_CONNECTOR_CPUS:-0.2}
+    mem_limit: ${OMNI_CONNECTOR_MEMORY:-384m}
+    container_name: omni-atlassian-connector
+    profiles:
+      - atlassian
+    expose:
+      - "${ATLASSIAN_CONNECTOR_PORT}"
+    environment:
+      <<: [*redis-config, *otel-config]
+      RUST_LOG: ${RUST_LOG}
+      PORT: ${ATLASSIAN_CONNECTOR_PORT}
+      CONNECTOR_MANAGER_URL: ${CONNECTOR_MANAGER_URL}
+      CONNECTOR_HOST_NAME: atlassian-connector
+    networks:
+      - omni-network
+    depends_on:
+      redis:
+        condition: service_healthy
+      connector-manager:
+        condition: service_started
+    restart: unless-stopped
+    logging: *default-logging
+
+  web-connector:
+    image: ghcr.io/getomnico/omni/omni-web-connector:${OMNI_VERSION:-latest}
+    <<: *resources-connector
+    cpus: ${OMNI_CONNECTOR_CPUS:-0.2}
+    mem_limit: ${OMNI_CONNECTOR_MEMORY:-384m}
+    container_name: omni-web-connector
+    profiles:
+      - web
+    expose:
+      - "${WEB_CONNECTOR_PORT}"
+    environment:
+      <<: [*redis-config, *otel-config]
+      RUST_LOG: ${RUST_LOG}
+      PORT: ${WEB_CONNECTOR_PORT}
+      CONNECTOR_MANAGER_URL: ${CONNECTOR_MANAGER_URL}
+      CONNECTOR_HOST_NAME: web-connector
+    networks:
+      - omni-network
+    depends_on:
+      connector-manager:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    logging: *default-logging
+
+  github-connector:
+    image: ghcr.io/getomnico/omni/omni-github-connector:${OMNI_VERSION:-latest}
+    <<: *resources-connector
+    cpus: ${OMNI_CONNECTOR_CPUS:-0.2}
+    mem_limit: ${OMNI_CONNECTOR_MEMORY:-384m}
+    container_name: omni-github-connector
+    profiles:
+      - github
+    expose:
+      - "${GITHUB_CONNECTOR_PORT:-8010}"
+    environment:
+      <<: *otel-config
+      PORT: ${GITHUB_CONNECTOR_PORT:-8010}
+      CONNECTOR_MANAGER_URL: ${CONNECTOR_MANAGER_URL}
+      CONNECTOR_HOST_NAME: github-connector
+    networks:
+      - omni-network
+    depends_on:
+      connector-manager:
+        condition: service_started
+    restart: unless-stopped
+    logging: *default-logging
+
+  notion-connector:
+    image: ghcr.io/getomnico/omni/omni-notion-connector:${OMNI_VERSION:-latest}
+    <<: *resources-connector
+    cpus: ${OMNI_CONNECTOR_CPUS:-0.2}
+    mem_limit: ${OMNI_CONNECTOR_MEMORY:-384m}
+    container_name: omni-notion-connector
+    profiles:
+      - notion
+    expose:
+      - "${NOTION_CONNECTOR_PORT}"
+    environment:
+      <<: *otel-config
+      PORT: ${NOTION_CONNECTOR_PORT}
+      CONNECTOR_MANAGER_URL: ${CONNECTOR_MANAGER_URL}
+      CONNECTOR_HOST_NAME: notion-connector
+    networks:
+      - omni-network
+    depends_on:
+      connector-manager:
+        condition: service_started
+    restart: unless-stopped
+    logging: *default-logging
+
+  hubspot-connector:
+    image: ghcr.io/getomnico/omni/omni-hubspot-connector:${OMNI_VERSION:-latest}
+    <<: *resources-connector
+    cpus: ${OMNI_CONNECTOR_CPUS:-0.2}
+    mem_limit: ${OMNI_CONNECTOR_MEMORY:-384m}
+    container_name: omni-hubspot-connector
+    profiles:
+      - hubspot
+    expose:
+      - "${HUBSPOT_CONNECTOR_PORT}"
+    environment:
+      <<: *otel-config
+      PORT: ${HUBSPOT_CONNECTOR_PORT}
+      CONNECTOR_MANAGER_URL: ${CONNECTOR_MANAGER_URL}
+      CONNECTOR_HOST_NAME: hubspot-connector
+    networks:
+      - omni-network
+    depends_on:
+      connector-manager:
+        condition: service_started
+    restart: unless-stopped
+    logging: *default-logging
+
+  google-ads-connector:
+    image: ghcr.io/getomnico/omni/omni-google_ads-connector:${OMNI_VERSION:-latest}
+    <<: *resources-connector
+    cpus: ${OMNI_CONNECTOR_CPUS:-0.2}
+    mem_limit: ${OMNI_CONNECTOR_MEMORY:-384m}
+    container_name: omni-google_ads-connector
+    profiles:
+      - google_ads
+    expose:
+      - "${GOOGLE_ADS_CONNECTOR_PORT}"
+    environment:
+      <<: *otel-config
+      PORT: ${GOOGLE_ADS_CONNECTOR_PORT}
+      CONNECTOR_MANAGER_URL: ${CONNECTOR_MANAGER_URL}
+      CONNECTOR_HOST_NAME: google-ads-connector
+    networks:
+      - omni-network
+    depends_on:
+      connector-manager:
+        condition: service_started
+    restart: unless-stopped
+    logging: *default-logging
+
+  darwinbox-connector:
+    image: ghcr.io/getomnico/omni/omni-darwinbox-connector:${OMNI_VERSION:-latest}
+    <<: *resources-connector
+    cpus: ${OMNI_CONNECTOR_CPUS:-0.2}
+    mem_limit: ${OMNI_CONNECTOR_MEMORY:-384m}
+    container_name: omni-darwinbox-connector
+    profiles:
+      - darwinbox
+    expose:
+      - "${DARWINBOX_CONNECTOR_PORT}"
+    environment:
+      <<: *otel-config
+      PORT: ${DARWINBOX_CONNECTOR_PORT}
+      CONNECTOR_MANAGER_URL: ${CONNECTOR_MANAGER_URL}
+      CONNECTOR_HOST_NAME: darwinbox-connector
+    networks:
+      - omni-network
+    depends_on:
+      connector-manager:
+        condition: service_started
+    restart: unless-stopped
+    logging: *default-logging
+
+  fireflies-connector:
+    image: ghcr.io/getomnico/omni/omni-fireflies-connector:${OMNI_VERSION:-latest}
+    <<: *resources-connector
+    cpus: ${OMNI_CONNECTOR_CPUS:-0.2}
+    mem_limit: ${OMNI_CONNECTOR_MEMORY:-384m}
+    container_name: omni-fireflies-connector
+    profiles:
+      - fireflies
+    expose:
+      - "${FIREFLIES_CONNECTOR_PORT}"
+    environment:
+      <<: *otel-config
+      PORT: ${FIREFLIES_CONNECTOR_PORT}
+      CONNECTOR_MANAGER_URL: ${CONNECTOR_MANAGER_URL}
+      CONNECTOR_HOST_NAME: fireflies-connector
+    networks:
+      - omni-network
+    depends_on:
+      connector-manager:
+        condition: service_started
+    restart: unless-stopped
+    logging: *default-logging
+
+  imap-connector:
+    image: ghcr.io/getomnico/omni/omni-imap-connector:${OMNI_VERSION:-latest}
+    <<: *resources-connector
+    cpus: ${OMNI_CONNECTOR_CPUS:-0.2}
+    mem_limit: ${OMNI_CONNECTOR_MEMORY:-384m}
+    container_name: omni-imap-connector
+    profiles:
+      - imap
+    expose:
+      - "${IMAP_CONNECTOR_PORT}"
+    environment:
+      <<: *otel-config
+      PORT: ${IMAP_CONNECTOR_PORT}
+      CONNECTOR_MANAGER_URL: ${CONNECTOR_MANAGER_URL}
+      CONNECTOR_HOST_NAME: imap-connector
+    networks:
+      - omni-network
+    depends_on:
+      connector-manager:
+        condition: service_started
+    restart: unless-stopped
+    logging: *default-logging
+
+  nextcloud-connector:
+    image: ghcr.io/getomnico/omni/omni-nextcloud-connector:${OMNI_VERSION:-latest}
+    <<: *resources-connector
+    cpus: ${OMNI_CONNECTOR_CPUS:-0.2}
+    mem_limit: ${OMNI_CONNECTOR_MEMORY:-384m}
+    container_name: omni-nextcloud-connector
+    profiles:
+      - nextcloud
+    expose:
+      - "${NEXTCLOUD_CONNECTOR_PORT}"
+    environment:
+      <<: *otel-config
+      PORT: ${NEXTCLOUD_CONNECTOR_PORT}
+      CONNECTOR_MANAGER_URL: ${CONNECTOR_MANAGER_URL}
+      CONNECTOR_HOST_NAME: nextcloud-connector
+    networks:
+      - omni-network
+    depends_on:
+      connector-manager:
+        condition: service_started
+    restart: unless-stopped
+    logging: *default-logging
+
+  paperless-connector:
+    image: ghcr.io/getomnico/omni/omni-paperless-connector:${OMNI_VERSION:-latest}
+    <<: *resources-connector
+    cpus: ${OMNI_CONNECTOR_CPUS:-0.2}
+    mem_limit: ${OMNI_CONNECTOR_MEMORY:-384m}
+    build:
+      context: ..
+      dockerfile: connectors/paperless/Dockerfile
+    container_name: omni-paperless-connector
+    profiles:
+      - paperless
+    expose:
+      - "${PAPERLESS_CONNECTOR_PORT}"
+    environment:
+      <<: *otel-config
+      PORT: ${PAPERLESS_CONNECTOR_PORT}
+      CONNECTOR_MANAGER_URL: ${CONNECTOR_MANAGER_URL}
+      CONNECTOR_HOST_NAME: paperless-connector
+    networks:
+      - omni-network
+    depends_on:
+      connector-manager:
+        condition: service_started
+    restart: unless-stopped
+    logging: *default-logging
+
+  linear-connector:
+    image: ghcr.io/getomnico/omni/omni-linear-connector:${OMNI_VERSION:-latest}
+    <<: *resources-connector
+    cpus: ${OMNI_CONNECTOR_CPUS:-0.2}
+    mem_limit: ${OMNI_CONNECTOR_MEMORY:-384m}
+    container_name: omni-linear-connector
+    profiles:
+      - linear
+    expose:
+      - "${LINEAR_CONNECTOR_PORT}"
+    environment:
+      <<: *otel-config
+      PORT: ${LINEAR_CONNECTOR_PORT}
+      CONNECTOR_MANAGER_URL: ${CONNECTOR_MANAGER_URL}
+      CONNECTOR_HOST_NAME: linear-connector
+    networks:
+      - omni-network
+    depends_on:
+      connector-manager:
+        condition: service_started
+    restart: unless-stopped
+    logging: *default-logging
+
+  windshift-connector:
+    image: ghcr.io/getomnico/omni/omni-windshift-connector:${OMNI_VERSION:-latest}
+    <<: *resources-connector
+    cpus: ${OMNI_CONNECTOR_CPUS:-0.2}
+    mem_limit: ${OMNI_CONNECTOR_MEMORY:-384m}
+    container_name: omni-windshift-connector
+    profiles:
+      - windshift
+    expose:
+      - "${WINDSHIFT_CONNECTOR_PORT:-4018}"
+    environment:
+      <<: *otel-config
+      PORT: ${WINDSHIFT_CONNECTOR_PORT:-4018}
+      CONNECTOR_MANAGER_URL: ${CONNECTOR_MANAGER_URL}
+      CONNECTOR_HOST_NAME: windshift-connector
+      # The public Windshift base URL is configured in the admin UI (stored in
+      # the connector_configs table); WINDSHIFT_BASE_URL is only a fallback for
+      # deployments that predate the UI setting. WINDSHIFT_INTERNAL_BASE_URL is
+      # env-only: an optional private route for server-to-server traffic.
+      WINDSHIFT_BASE_URL: ${WINDSHIFT_BASE_URL:-}
+      WINDSHIFT_INTERNAL_BASE_URL: ${WINDSHIFT_INTERNAL_BASE_URL:-}
+    networks:
+      - omni-network
+    depends_on:
+      connector-manager:
+        condition: service_started
+    restart: unless-stopped
+    logging: *default-logging
+
+  salesforce-connector:
+    image: ghcr.io/getomnico/omni/omni-salesforce-connector:${OMNI_VERSION:-latest}
+    <<: *resources-connector
+    cpus: ${OMNI_CONNECTOR_CPUS:-0.2}
+    mem_limit: 1g
+    container_name: omni-salesforce-connector
+    profiles:
+      - salesforce
+    expose:
+      - "${SALESFORCE_CONNECTOR_PORT:-4019}"
+    environment:
+      <<: *otel-config
+      PORT: ${SALESFORCE_CONNECTOR_PORT:-4019}
+      CONNECTOR_MANAGER_URL: ${CONNECTOR_MANAGER_URL}
+      CONNECTOR_HOST_NAME: salesforce-connector
+    networks:
+      - omni-network
+    depends_on:
+      connector-manager:
+        condition: service_started
+    restart: unless-stopped
+    logging: *default-logging
+
+  snowflake-connector:
+    image: ghcr.io/getomnico/omni/omni-snowflake-connector:${OMNI_VERSION:-latest}
+    <<: *resources-connector
+    cpus: ${OMNI_CONNECTOR_CPUS:-0.2}
+    mem_limit: ${OMNI_CONNECTOR_MEMORY:-512m}
+    container_name: omni-snowflake-connector
+    profiles:
+      - snowflake
+    expose:
+      - "${SNOWFLAKE_CONNECTOR_PORT:-4020}"
+    environment:
+      <<: *otel-config
+      PORT: ${SNOWFLAKE_CONNECTOR_PORT:-4020}
+      CONNECTOR_MANAGER_URL: ${CONNECTOR_MANAGER_URL}
+      CONNECTOR_HOST_NAME: snowflake-connector
+    networks:
+      - omni-network
+    depends_on:
+      connector-manager:
+        condition: service_started
+    restart: unless-stopped
+    logging: *default-logging
+
+  microsoft-connector:
+    image: ghcr.io/getomnico/omni/omni-microsoft-connector:${OMNI_VERSION:-latest}
+    <<: *resources-connector
+    cpus: ${OMNI_CONNECTOR_CPUS:-0.2}
+    mem_limit: ${OMNI_CONNECTOR_MEMORY:-384m}
+    container_name: omni-microsoft-connector
+    profiles:
+      - microsoft
+    expose:
+      - "${MICROSOFT_CONNECTOR_PORT}"
+    environment:
+      <<: *otel-config
+      PORT: ${MICROSOFT_CONNECTOR_PORT}
+      CONNECTOR_MANAGER_URL: ${CONNECTOR_MANAGER_URL}
+      CONNECTOR_HOST_NAME: microsoft-connector
+    networks:
+      - omni-network
+    depends_on:
+      connector-manager:
+        condition: service_started
+    restart: unless-stopped
+    logging: *default-logging
+
+  clickup-connector:
+    image: ghcr.io/getomnico/omni/omni-clickup-connector:${OMNI_VERSION:-latest}
+    <<: *resources-connector
+    cpus: ${OMNI_CONNECTOR_CPUS:-0.2}
+    mem_limit: ${OMNI_CONNECTOR_MEMORY:-384m}
+    container_name: omni-clickup-connector
+    profiles:
+      - clickup
+    expose:
+      - "${CLICKUP_CONNECTOR_PORT:-8011}"
+    environment:
+      <<: *otel-config
+      PORT: ${CLICKUP_CONNECTOR_PORT:-8011}
+      CONNECTOR_MANAGER_URL: ${CONNECTOR_MANAGER_URL}
+      CONNECTOR_HOST_NAME: clickup-connector
+    networks:
+      - omni-network
+    depends_on:
+      connector-manager:
+        condition: service_started
+    restart: unless-stopped
+    logging: *default-logging
+
+  filesystem-connector:
+    image: ghcr.io/getomnico/omni/omni-filesystem-connector:${OMNI_VERSION:-latest}
+    <<: *resources-connector
+    cpus: ${OMNI_CONNECTOR_CPUS:-0.2}
+    mem_limit: ${OMNI_CONNECTOR_MEMORY:-384m}
+    container_name: omni-filesystem-connector
+    profiles:
+      - filesystem
+    expose:
+      - "${FILESYSTEM_CONNECTOR_PORT}"
+    environment:
+      <<: [*db-config, *db-pool-config, *otel-config]
+      PORT: ${FILESYSTEM_CONNECTOR_PORT}
+      CONNECTOR_MANAGER_URL: ${CONNECTOR_MANAGER_URL}
+      CONNECTOR_HOST_NAME: filesystem-connector
+    networks:
+      - omni-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
+      connector-manager:
+        condition: service_started
+    restart: unless-stopped
+    logging: *default-logging
+
+  # Web Application (SvelteKit frontend + backend)
+  web:
+    image: ghcr.io/getomnico/omni/omni-web:${OMNI_VERSION:-latest}
+    <<: *resources-high
+    cpus: ${OMNI_WEB_CPUS:-0.5}
+    mem_limit: ${OMNI_WEB_MEMORY:-512m}
+    container_name: omni-web
+    expose:
+      - "${WEB_PORT}"
+    environment:
+      <<: [*db-config, *db-pool-config, *redis-config, *otel-config, *docling-config]
+      SEARCHER_URL: ${SEARCHER_URL}
+      INDEXER_URL: ${INDEXER_URL}
+      AI_SERVICE_URL: ${AI_SERVICE_URL}
+      CONNECTOR_MANAGER_URL: ${CONNECTOR_MANAGER_URL}
+      SESSION_COOKIE_NAME: ${SESSION_COOKIE_NAME}
+      SESSION_DURATION_DAYS: ${SESSION_DURATION_DAYS}
+      APP_URL: ${APP_URL}
+      ORIGIN: ${APP_URL}
+      AI_ANSWER_ENABLED: ${AI_ANSWER_ENABLED}
+      AGENTS_ENABLED: ${AGENTS_ENABLED:-false}
+      MEMORY_ENABLED: ${MEMORY_ENABLED:-false}
+      DOCLING_ENABLED: ${DOCLING_ENABLED:-false}
+      BODY_SIZE_LIMIT: ${BODY_SIZE_LIMIT:-50M}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      ENCRYPTION_SALT: ${ENCRYPTION_SALT}
+    networks:
+      - omni-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
+      searcher:
+        condition: service_started
+      indexer:
+        condition: service_started
+      ai:
+        condition: service_started
+    restart: unless-stopped
+    logging: *default-logging
+
+  # Load Balancer / Reverse Proxy
+  caddy:
+    image: caddy:2-alpine
+    <<: *resources-high
+    cpus: ${OMNI_CADDY_CPUS:-0.2}
+    mem_limit: ${OMNI_CADDY_MEMORY:-128m}
+    container_name: omni-caddy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ../Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      OMNI_DOMAIN: ${OMNI_DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL}
+      WEB_PORT: ${WEB_PORT}
+      GOOGLE_CONNECTOR_PORT: ${GOOGLE_CONNECTOR_PORT}
+      SLACK_CONNECTOR_PORT: ${SLACK_CONNECTOR_PORT}
+      ATLASSIAN_CONNECTOR_PORT: ${ATLASSIAN_CONNECTOR_PORT}
+    networks:
+      - omni-network
+    depends_on:
+      - web
+    restart: unless-stopped
+    logging: *default-logging
+
+networks:
+  omni-network:
+    driver: bridge
+  sandbox-net:
+    driver: bridge
+    internal: true  # No external network access
+
+volumes:
+  postgres_data:
+    name: omni-postgres-data
+  redis_data:
+    name: omni-redis-data
+  ai_models:
+    name: omni-ai-models
+  tei_models:
+    name: omni-tei-models
+  docling_models:
+    name: omni-docling-models
+  caddy_data:
+    name: omni-caddy-data
+  caddy_config:
+    name: omni-caddy-config
+  sandbox_data:
+    name: omni-sandbox-data

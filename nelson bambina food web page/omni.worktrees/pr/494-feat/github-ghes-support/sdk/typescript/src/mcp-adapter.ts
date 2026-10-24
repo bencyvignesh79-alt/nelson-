@@ -1,0 +1,437 @@
+import type { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { readFileSync, rmSync } from 'node:fs';
+import type {
+  ActionDefinition,
+  McpPromptDefinition,
+  McpResourceDefinition,
+} from './models.js';
+import { ActionResponse } from './models.js';
+import { getLogger } from './logger.js';
+
+const logger = getLogger('sdk:mcp-adapter');
+
+/**
+ * Env var a stdio MCP launcher can set to point at a per-attempt status file.
+ * When a session fails, the adapter checks the file: content
+ * `needs_user_auth` means the provider rejected the credential and the
+ * failure is normalized into `MCP_AUTH_REQUIRED_MESSAGE` so the HTTP server
+ * can return the standard 412 response.
+ */
+export const MCP_AUTH_STATUS_FILE_ENV = 'OMNI_MCP_AUTH_STATUS_FILE';
+/** Canonical failure message produced when the auth-status marker is present. */
+export const MCP_AUTH_REQUIRED_MESSAGE = 'MCP authentication required';
+
+/**
+ * Configuration for an MCP server reached via stdio (subprocess).
+ */
+export interface StdioMcpServer {
+  transport: 'stdio';
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+  cwd?: string;
+}
+
+/**
+ * Configuration for a remote MCP server reached via Streamable HTTP.
+ */
+export interface HttpMcpServer {
+  transport: 'http';
+  url: string;
+  headers?: Record<string, string>;
+  /** Forwarded to StreamableHTTPClientTransport's `requestInit` (merged with `headers`). */
+  requestInit?: RequestInit;
+}
+
+export type McpServer = StdioMcpServer | HttpMcpServer;
+
+/**
+ * Bridges an external MCP server into Omni's connector protocol.
+ *
+ * Supports two transports:
+ * - stdio: spawns the MCP server as a subprocess and talks JSON-RPC over
+ *   stdin/stdout.
+ * - Streamable HTTP: connects to a remote MCP endpoint per the MCP spec.
+ *
+ * Each operation opens a fresh client/transport pair and tears it down
+ * afterwards. Tool/resource/prompt definitions are cached after the first
+ * successful discovery so manifest builds don't require live auth.
+ */
+export class McpAdapter {
+  private server: McpServer;
+  private cachedActions: ActionDefinition[] | null = null;
+  private cachedResources: McpResourceDefinition[] | null = null;
+  private cachedPrompts: McpPromptDefinition[] | null = null;
+
+  constructor(server: McpServer) {
+    this.server = server;
+  }
+
+  hasCachedCatalog(): boolean {
+    return (
+      this.cachedActions !== null &&
+      this.cachedResources !== null &&
+      this.cachedPrompts !== null
+    );
+  }
+
+  hasCachedAction(name: string): boolean {
+    return this.cachedActions?.some((action) => action.name === name) ?? false;
+  }
+
+  clearCachedCatalog(): void {
+    this.cachedActions = null;
+    this.cachedResources = null;
+    this.cachedPrompts = null;
+  }
+
+  private async withSession<T>(
+    env: Record<string, string> | undefined,
+    headers: Record<string, string> | undefined,
+    fn: (client: Client) => Promise<T>
+  ): Promise<T> {
+    const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+    const client = new Client({ name: 'omni-mcp-adapter', version: '1.0.0' });
+    let connected = false;
+    try {
+      if (this.server.transport === 'stdio') {
+        const { StdioClientTransport } = await import(
+          '@modelcontextprotocol/sdk/client/stdio.js'
+        );
+        const mergedEnv = { ...(this.server.env ?? {}), ...(env ?? {}) };
+        const transport = new StdioClientTransport({
+          command: this.server.command,
+          args: this.server.args,
+          env: Object.keys(mergedEnv).length > 0 ? mergedEnv : undefined,
+          cwd: this.server.cwd,
+        });
+        logger.debug(
+          `Spawning MCP subprocess: ${this.server.command} ${(this.server.args ?? []).join(' ')}`
+        );
+        await client.connect(transport);
+        connected = true;
+        return await fn(client);
+      }
+      const { StreamableHTTPClientTransport } = await import(
+        '@modelcontextprotocol/sdk/client/streamableHttp.js'
+      );
+      const mergedHeaders = { ...(this.server.headers ?? {}), ...(headers ?? {}) };
+      const baseInit = this.server.requestInit ?? {};
+      const baseHeaders = (baseInit.headers ?? {}) as Record<string, string>;
+      const transport = new StreamableHTTPClientTransport(new URL(this.server.url), {
+        requestInit: {
+          ...baseInit,
+          headers: { ...baseHeaders, ...mergedHeaders },
+        },
+      });
+      logger.debug(`Opening MCP HTTP session: ${this.server.url}`);
+      await client.connect(transport);
+      connected = true;
+      return await fn(client);
+    } catch (err) {
+      // A provider launcher may leave this short-lived marker after a
+      // terminal OAuth rejection. Consume it here so bootstrap callers also
+      // clean it up, while the normalized error lets the HTTP server return
+      // the standard 412 response.
+      return this.consumeAuthStatusFile(env, err);
+    } finally {
+      if (connected) {
+        await client.close().catch(() => undefined);
+      }
+    }
+  }
+
+  /**
+   * Read and remove the per-attempt auth-status marker file, throwing the
+   * normalized auth-required error when the launcher recorded a terminal
+   * OAuth rejection. Marker IO is best effort: a missing or unreadable file
+   * must not mask the original failure.
+   */
+  private consumeAuthStatusFile(
+    env: Record<string, string> | undefined,
+    err: unknown
+  ): never {
+    const statusFile = env?.[MCP_AUTH_STATUS_FILE_ENV];
+    if (typeof statusFile === 'string' && statusFile.length > 0) {
+      let requiresAuth = false;
+      try {
+        requiresAuth = readFileSync(statusFile, 'utf8').trim() === 'needs_user_auth';
+      } catch {
+        // The launcher's cleanup may already have removed the file.
+      }
+      try {
+        rmSync(statusFile, { force: true });
+      } catch {
+        // Cleanup is best effort.
+      }
+      if (requiresAuth) {
+        throw new Error(MCP_AUTH_REQUIRED_MESSAGE);
+      }
+    }
+    throw err;
+  }
+
+  async discover(
+    env?: Record<string, string>,
+    headers?: Record<string, string>
+  ): Promise<void> {
+    const catalog = await this.withSession(env, headers, async (client) => ({
+      actions: await this.fetchActions(client),
+      resources: await this.fetchResources(client),
+      prompts: await this.fetchPrompts(client),
+    }));
+    this.cachedActions = catalog.actions;
+    this.cachedResources = catalog.resources;
+    this.cachedPrompts = catalog.prompts;
+    logger.info(
+      `MCP discovery complete: ${catalog.actions.length} tools, ` +
+        `${catalog.resources.length} resources, ` +
+        `${catalog.prompts.length} prompts`
+    );
+  }
+
+  async getActionDefinitionsLive(
+    env?: Record<string, string>,
+    headers?: Record<string, string>
+  ): Promise<ActionDefinition[]> {
+    const actions = await this.withSession(env, headers, (c) =>
+      this.fetchActions(c)
+    );
+    this.cachedActions = actions;
+    return actions;
+  }
+
+  async getActionDefinitions(
+    env?: Record<string, string>,
+    headers?: Record<string, string>
+  ): Promise<ActionDefinition[]> {
+    if (env !== undefined || headers !== undefined) {
+      try {
+        const actions = await this.withSession(env, headers, (c) =>
+          this.fetchActions(c)
+        );
+        this.cachedActions = actions;
+        return actions;
+      } catch (err) {
+        if (this.cachedActions !== null) {
+          logger.debug(
+            `Live action fetch failed, returning ${this.cachedActions.length} cached`
+          );
+          return this.cachedActions;
+        }
+        throw err;
+      }
+    }
+    return this.cachedActions ?? [];
+  }
+
+  async getResourceDefinitions(
+    env?: Record<string, string>,
+    headers?: Record<string, string>
+  ): Promise<McpResourceDefinition[]> {
+    if (env !== undefined || headers !== undefined) {
+      try {
+        const resources = await this.withSession(env, headers, (c) =>
+          this.fetchResources(c)
+        );
+        this.cachedResources = resources;
+        return resources;
+      } catch (err) {
+        if (this.cachedResources !== null) {
+          return this.cachedResources;
+        }
+        throw err;
+      }
+    }
+    return this.cachedResources ?? [];
+  }
+
+  async getPromptDefinitions(
+    env?: Record<string, string>,
+    headers?: Record<string, string>
+  ): Promise<McpPromptDefinition[]> {
+    if (env !== undefined || headers !== undefined) {
+      try {
+        const prompts = await this.withSession(env, headers, (c) =>
+          this.fetchPrompts(c)
+        );
+        this.cachedPrompts = prompts;
+        return prompts;
+      } catch (err) {
+        if (this.cachedPrompts !== null) {
+          return this.cachedPrompts;
+        }
+        throw err;
+      }
+    }
+    return this.cachedPrompts ?? [];
+  }
+
+  async executeTool(
+    name: string,
+    args: Record<string, unknown>,
+    env?: Record<string, string>,
+    headers?: Record<string, string>
+  ): Promise<ActionResponse> {
+    try {
+      return await this.withSession(env, headers, async (client) => {
+        const result = await client.callTool({ name, arguments: args });
+        if (result.isError) {
+          const errorText = (
+            result.content as Array<{ type: string; text?: string }>
+          )
+            .filter((c) => c.type === 'text')
+            .map((c) => c.text ?? '')
+            .join('\n');
+          return ActionResponse.failure(errorText || 'Tool execution failed');
+        }
+
+        if (
+          result.structuredContent &&
+          typeof result.structuredContent === 'object'
+        ) {
+          return ActionResponse.success(
+            result.structuredContent as Record<string, unknown>
+          );
+        }
+
+        const textParts: string[] = [];
+        for (const block of result.content as Array<{
+          type: string;
+          text?: string;
+          mimeType?: string;
+        }>) {
+          if (block.type === 'text' && block.text) {
+            textParts.push(block.text);
+          } else if (block.type === 'image') {
+            textParts.push(`[binary: ${block.mimeType ?? 'unknown'}]`);
+          }
+        }
+        return ActionResponse.success({ content: textParts.join('\n') });
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error({ err }, `MCP tool ${name} failed`);
+      return ActionResponse.failure(message);
+    }
+  }
+
+  async readResource(
+    uri: string,
+    env?: Record<string, string>,
+    headers?: Record<string, string>
+  ): Promise<{ contents: Array<Record<string, unknown>> }> {
+    return await this.withSession(env, headers, async (client) => {
+      const result = await client.readResource({ uri });
+      const items: Array<Record<string, unknown>> = [];
+      for (const item of result.contents) {
+        const entry: Record<string, unknown> = { uri: item.uri ?? uri };
+        if ('text' in item && item.text != null) {
+          entry.text = item.text;
+        }
+        if ('blob' in item && item.blob != null) {
+          entry.blob = item.blob;
+        }
+        if (item.mimeType) {
+          entry.mime_type = item.mimeType;
+        }
+        items.push(entry);
+      }
+      return { contents: items };
+    });
+  }
+
+  async getPrompt(
+    name: string,
+    args?: Record<string, unknown>,
+    env?: Record<string, string>,
+    headers?: Record<string, string>
+  ): Promise<{ description?: string; messages: Array<Record<string, unknown>> }> {
+    return await this.withSession(env, headers, async (client) => {
+      const result = await client.getPrompt({
+        name,
+        arguments: args as Record<string, string> | undefined,
+      });
+      const messages: Array<Record<string, unknown>> = [];
+      for (const msg of result.messages) {
+        let contentData: Record<string, unknown>;
+        if (msg.content.type === 'text') {
+          contentData = { type: 'text', text: msg.content.text };
+        } else {
+          contentData = { type: msg.content.type };
+        }
+        messages.push({ role: msg.role, content: contentData });
+      }
+      return { description: result.description, messages };
+    });
+  }
+
+  // -- internal helpers --
+
+  private async fetchActions(client: Client): Promise<ActionDefinition[]> {
+    const { tools } = await client.listTools();
+    const actions: ActionDefinition[] = [];
+    for (const tool of tools) {
+      const isReadOnly = tool.annotations?.readOnlyHint === true;
+      const meta = (tool as { _meta?: Record<string, unknown> })._meta;
+      const requiredScopes = Array.isArray(meta?.required_scopes)
+        ? meta.required_scopes.filter(
+            (scope): scope is string => typeof scope === 'string'
+          )
+        : undefined;
+      actions.push({
+        name: tool.name,
+        description: tool.description ?? '',
+        input_schema: tool.inputSchema ?? { type: 'object', properties: {} },
+        mode: isReadOnly ? 'read' : 'write',
+        credential_scope: 'user',
+        required_scopes: requiredScopes,
+        source_types: [],
+        admin_only: false,
+        actor_scoped: false,
+        hidden: false,
+        origin: 'mcp',
+      });
+    }
+    return actions;
+  }
+
+  private async fetchResources(client: Client): Promise<McpResourceDefinition[]> {
+    const definitions: McpResourceDefinition[] = [];
+
+    const { resourceTemplates } = await client.listResourceTemplates();
+    for (const tmpl of resourceTemplates) {
+      definitions.push({
+        uri_template: tmpl.uriTemplate,
+        name: tmpl.name,
+        description: tmpl.description,
+        mime_type: tmpl.mimeType,
+      });
+    }
+
+    const { resources } = await client.listResources();
+    for (const res of resources) {
+      definitions.push({
+        uri_template: res.uri,
+        name: res.name,
+        description: res.description,
+        mime_type: res.mimeType,
+      });
+    }
+
+    return definitions;
+  }
+
+  private async fetchPrompts(client: Client): Promise<McpPromptDefinition[]> {
+    const { prompts } = await client.listPrompts();
+    return prompts.map((prompt) => ({
+      name: prompt.name,
+      description: prompt.description,
+      arguments: (prompt.arguments ?? []).map((arg) => ({
+        name: arg.name,
+        description: arg.description,
+        required: arg.required ?? false,
+      })),
+    }));
+  }
+}

@@ -1,0 +1,271 @@
+# Development-specific overrides
+# Usage: docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
+
+x-dev-db-config: &dev-db-config
+  POSTGRES_DB: omni_dev
+  POSTGRES_USER: omni_dev
+  POSTGRES_PASSWORD: omni_dev_password
+
+x-dev-database-url: &dev-database-url
+  DATABASE_HOST: postgres
+  DATABASE_PORT: 5432
+  DATABASE_USERNAME: omni_dev
+  DATABASE_PASSWORD: omni_dev_password
+  DATABASE_NAME: omni_dev
+
+services:
+  # Infrastructure only for development
+  postgres:
+    ports:
+      - "5432:5432"
+    environment:
+      <<: *dev-db-config
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U omni_dev -d omni_dev"]
+
+  redis:
+    ports:
+      - "6379:6379"
+
+  # Override for development with hot reload
+  web:
+    image: omni-web:dev
+    build:
+      context: ../web
+      dockerfile: Dockerfile.dev
+    ports:
+      - "${WEB_PORT}:${WEB_PORT}"
+    volumes:
+      - ../web/src:/app/src
+      - ../web/static:/app/static
+    environment:
+      <<: *dev-database-url
+      NODE_ENV: development
+      BODY_SIZE_LIMIT: ${BODY_SIZE_LIMIT:-50M}
+    command: npm run dev -- --host 0.0.0.0 --port ${WEB_PORT}
+
+  # Update database URLs for all services in dev
+
+  migrator:
+    image: omni-migrator:dev
+    build:
+      context: ..
+      dockerfile: services/migrations/Dockerfile
+    environment:
+      <<: *dev-database-url
+
+  searcher:
+    image: omni-searcher:dev
+    build:
+      context: ..
+      dockerfile: services/searcher/Dockerfile
+    ports:
+      - "${SEARCHER_PORT}:${SEARCHER_PORT}"
+    environment:
+      <<: *dev-database-url
+      RUST_BACKTRACE: full
+
+  indexer:
+    image: omni-indexer:dev
+    build:
+      context: ..
+      dockerfile: services/indexer/Dockerfile
+    ports:
+      - "${INDEXER_PORT}:${INDEXER_PORT}"
+    environment:
+      <<: *dev-database-url
+      RUST_BACKTRACE: full
+
+  ai:
+    image: omni-ai:dev
+    build:
+      context: ../services/ai
+      dockerfile: Dockerfile
+    ports:
+      - "${AI_SERVICE_PORT}:${AI_SERVICE_PORT}"
+    environment:
+      <<: *dev-database-url
+      LOG_LEVEL: debug
+    volumes:
+      - ../services/ai:/app
+      - /app/.venv
+    command: python -m uvicorn main:app --host 0.0.0.0 --port ${AI_SERVICE_PORT} --reload
+
+  sandbox:
+    image: omni-sandbox:dev
+    build:
+      context: ..
+      dockerfile: services/sandbox/Dockerfile
+    ports:
+      - "${SANDBOX_PORT}:${SANDBOX_PORT}"
+
+  connector-manager:
+    image: omni-connector-manager:dev
+    build:
+      context: ..
+      dockerfile: services/connector-manager/Dockerfile
+    ports:
+      - "${CONNECTOR_MANAGER_PORT}:${CONNECTOR_MANAGER_PORT}"
+    environment:
+      <<: *dev-database-url
+      RUST_BACKTRACE: full
+
+  google-connector:
+    image: omni-google-connector:dev
+    build:
+      context: ..
+      dockerfile: connectors/google/Dockerfile
+      args:
+        BUILD_MODE: debug
+    environment:
+      RUST_BACKTRACE: full
+
+  slack-connector:
+    image: omni-slack-connector:dev
+    build:
+      context: ..
+      dockerfile: connectors/slack/Dockerfile
+    environment:
+      RUST_BACKTRACE: full
+
+  atlassian-connector:
+    image: omni-atlassian-connector:dev
+    build:
+      context: ..
+      dockerfile: connectors/atlassian/Dockerfile
+    environment:
+      RUST_BACKTRACE: full
+
+  web-connector:
+    image: omni-web-connector:dev
+    build:
+      context: ..
+      dockerfile: connectors/web/Dockerfile
+      args:
+        BUILD_MODE: debug
+    environment:
+      RUST_BACKTRACE: full
+
+  github-connector:
+    image: omni-github-connector:dev
+    build:
+      context: ..
+      dockerfile: connectors/github/Dockerfile
+
+  notion-connector:
+    image: omni-notion-connector:dev
+    build:
+      context: ..
+      dockerfile: connectors/notion/Dockerfile
+
+  hubspot-connector:
+    image: omni-hubspot-connector:dev
+    build:
+      context: ..
+      dockerfile: connectors/hubspot/Dockerfile
+
+  google-ads-connector:
+    image: omni-google_ads-connector:dev
+    build:
+      context: ..
+      dockerfile: connectors/google_ads/Dockerfile
+
+  darwinbox-connector:
+    image: omni-darwinbox-connector:dev
+    build:
+      context: ..
+      dockerfile: connectors/darwinbox/Dockerfile
+    environment:
+      RUST_LOG: debug
+
+  fireflies-connector:
+    image: omni-fireflies-connector:dev
+    build:
+      context: ..
+      dockerfile: connectors/fireflies/Dockerfile
+    environment:
+      RUST_LOG: debug
+
+  imap-connector:
+    image: omni-imap-connector:dev
+    build:
+      context: ..
+      dockerfile: connectors/imap/Dockerfile
+    environment:
+      RUST_LOG: debug
+
+  nextcloud-connector:
+    image: omni-nextcloud-connector:dev
+    build:
+      context: ..
+      dockerfile: connectors/nextcloud/Dockerfile
+    environment:
+      RUST_LOG: debug
+
+  clickup-connector:
+    image: omni-clickup-connector:dev
+    build:
+      context: ..
+      dockerfile: connectors/clickup/Dockerfile
+
+  linear-connector:
+    image: omni-linear-connector:dev
+    build:
+      context: ..
+      dockerfile: connectors/linear/Dockerfile
+
+  windshift-connector:
+    image: omni-windshift-connector:dev
+    build:
+      context: ..
+      dockerfile: connectors/windshift/Dockerfile
+
+  salesforce-connector:
+    image: omni-salesforce-connector:dev
+    build:
+      context: ..
+      dockerfile: connectors/salesforce/Dockerfile
+
+  snowflake-connector:
+    image: omni-snowflake-connector:dev
+    build:
+      context: ..
+      dockerfile: connectors/snowflake/Dockerfile
+
+  microsoft-connector:
+    image: omni-microsoft-connector:dev
+    build:
+      context: ..
+      dockerfile: connectors/microsoft/Dockerfile
+
+  filesystem-connector:
+    image: omni-filesystem-connector:dev
+    build:
+      context: ..
+      dockerfile: connectors/filesystem/Dockerfile
+    environment:
+      <<: *dev-database-url
+      RUST_BACKTRACE: full
+
+  paperless-connector:
+    image: omni-paperless-connector:dev
+    build:
+      context: ..
+      dockerfile: connectors/paperless/Dockerfile
+
+  docling:
+    image: omni-docling:dev
+    build:
+      context: ../services/docling
+      dockerfile: Dockerfile
+      args:
+        DEVICE: ${DOCLING_DEVICE:-cpu}
+
+  embeddings:
+    ports:
+      - "${LOCAL_EMBEDDINGS_PORT}:${LOCAL_EMBEDDINGS_PORT}"
+
+  caddy:
+    profiles:
+      - production
+

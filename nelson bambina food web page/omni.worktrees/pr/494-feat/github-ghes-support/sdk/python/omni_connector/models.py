@@ -1,0 +1,631 @@
+from datetime import datetime
+from enum import Enum
+from typing import Annotated, Any, Literal, Self
+
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Discriminator, Field, Tag, field_validator
+
+
+class SyncMode(str, Enum):
+    FULL = "full"
+    INCREMENTAL = "incremental"
+    REALTIME = "realtime"
+
+
+class UserFilterMode(str, Enum):
+    ALL = "all"
+    WHITELIST = "whitelist"
+    BLACKLIST = "blacklist"
+
+
+class EventType(str, Enum):
+    DOCUMENT_CREATED = "document_created"
+    DOCUMENT_UPDATED = "document_updated"
+    DOCUMENT_DELETED = "document_deleted"
+    GROUP_MEMBERSHIP_SYNC = "group_membership_sync"
+    PERSON_SYNC = "person_sync"
+    PERSON_DELETED = "person_deleted"
+
+
+class DocumentMetadata(BaseModel):
+    title: str | None = None
+    author: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    content_type: str | None = None
+    mime_type: str | None = None
+    size: str | None = None
+    url: str | None = None
+    path: str | None = None
+    extra: dict[str, Any] | None = None
+
+
+class DocumentPermissions(BaseModel):
+    public: bool = False
+    users: list[str] = Field(default_factory=list)
+    groups: list[str] = Field(default_factory=list)
+
+
+class Document(BaseModel):
+    external_id: str
+    title: str
+    content_id: str
+    metadata: DocumentMetadata | None = None
+    permissions: DocumentPermissions | None = None
+    attributes: dict[str, Any] | None = None
+
+
+class DocumentEvent(BaseModel):
+    """Document create/update/delete event — mirrors Rust ConnectorEvent::Document* variants."""
+
+    type: Literal[
+        EventType.DOCUMENT_CREATED,
+        EventType.DOCUMENT_UPDATED,
+        EventType.DOCUMENT_DELETED,
+    ]
+    sync_run_id: str
+    source_id: str
+    document_id: str
+    content_id: str | None = None
+    metadata: DocumentMetadata | None = None
+    permissions: DocumentPermissions | None = None
+    attributes: dict[str, Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dict format matching Rust tagged enum serialization."""
+        base: dict[str, Any] = {
+            "type": self.type.value,
+            "sync_run_id": self.sync_run_id,
+            "source_id": self.source_id,
+            "document_id": self.document_id,
+        }
+        if self.type == EventType.DOCUMENT_DELETED:
+            return base
+
+        base["content_id"] = self.content_id
+        if self.metadata:
+            base["metadata"] = self.metadata.model_dump(mode="json", exclude_none=True)
+        else:
+            base["metadata"] = {}
+        if self.permissions:
+            base["permissions"] = self.permissions.model_dump()
+        else:
+            base["permissions"] = {"public": False, "users": [], "groups": []}
+        if self.attributes:
+            base["attributes"] = self.attributes
+        return base
+
+
+class PersonSyncRecord(BaseModel):
+    """A single source-provenanced person upsert record.
+    Mirrors Rust shared::models::PersonSyncRecord.
+    """
+
+    external_id: str
+    email: str
+    display_name: str | None = None
+    given_name: str | None = None
+    middle_name: str | None = None
+    surname: str | None = None
+    job_title: str | None = None
+    department: str | None = None
+    division: str | None = None
+    company_name: str | None = None
+    office_location: str | None = None
+    work_country: str | None = None
+    employee_id: str | None = None
+    employee_type: str | None = None
+    cost_center: str | None = None
+    grade: str | None = None
+    band: str | None = None
+    confirmation_status: str | None = None
+    employment_start_date: str | None = None
+    employment_end_date: str | None = None
+    manager_external_id: str | None = None
+    source_updated_at: str | None = None
+
+
+class GroupMembershipSyncEvent(BaseModel):
+    """Group membership sync event — mirrors Rust ConnectorEvent::GroupMembershipSync."""
+
+    type: Literal["group_membership_sync"] = "group_membership_sync"
+    sync_run_id: str
+    source_id: str
+    group_email: str
+    group_name: str | None = None
+    member_emails: list[str] = Field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dict format matching Rust tagged enum serialization."""
+        result: dict[str, Any] = {
+            "type": self.type,
+            "sync_run_id": self.sync_run_id,
+            "source_id": self.source_id,
+            "group_email": self.group_email,
+            "member_emails": self.member_emails,
+        }
+        if self.group_name:
+            result["group_name"] = self.group_name
+        return result
+
+
+class PersonSyncEvent(BaseModel):
+    """Idempotent source-provenanced person upsert."""
+
+    type: Literal["person_sync"] = "person_sync"
+    sync_run_id: str
+    source_id: str
+    person: PersonSyncRecord
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "type": self.type,
+            "sync_run_id": self.sync_run_id,
+            "source_id": self.source_id,
+            "person": self.person.model_dump(mode="json", exclude_none=True),
+        }
+
+
+class PersonDeletedEvent(BaseModel):
+    """Remove one source's current person entry by canonical email."""
+
+    type: Literal["person_deleted"] = "person_deleted"
+    sync_run_id: str
+    source_id: str
+    email: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return self.model_dump(mode="json")
+
+
+def _event_discriminator(v: Any) -> str:
+    raw_type = v.get("type", "") if isinstance(v, dict) else getattr(v, "type", "")
+    if raw_type == "group_membership_sync":
+        return "group"
+    if raw_type == "person_sync":
+        return "person_sync"
+    if raw_type == "person_deleted":
+        return "person_deleted"
+    return "document"
+
+
+ConnectorEvent = Annotated[
+    Annotated[DocumentEvent, Tag("document")]
+    | Annotated[GroupMembershipSyncEvent, Tag("group")]
+    | Annotated[PersonSyncEvent, Tag("person_sync")]
+    | Annotated[PersonDeletedEvent, Tag("person_deleted")],
+    Discriminator(_event_discriminator),
+]
+
+
+def connector_event(**data: Any) -> ConnectorEvent:
+    """Build the concrete source event selected by ``type``.
+
+    ``ConnectorEvent`` is the discriminated-union type used by SDK APIs;
+    this lowercase factory keeps the call-site ergonomics for connectors and
+    tests that construct events from a plain ``type`` key.
+    """
+    event_type = data.get("type")
+    event_type = event_type.value if isinstance(event_type, EventType) else event_type
+    event_model: type[BaseModel]
+    if event_type in {
+        EventType.DOCUMENT_CREATED.value,
+        EventType.DOCUMENT_UPDATED.value,
+        EventType.DOCUMENT_DELETED.value,
+    }:
+        event_model = DocumentEvent
+    elif event_type == EventType.GROUP_MEMBERSHIP_SYNC.value:
+        event_model = GroupMembershipSyncEvent
+    elif event_type == EventType.PERSON_SYNC.value:
+        event_model = PersonSyncEvent
+    elif event_type == EventType.PERSON_DELETED.value:
+        event_model = PersonDeletedEvent
+    else:
+        raise ValueError(f"Unknown connector event type: {event_type!r}")
+    return event_model(**data)
+
+
+ActionCredentialScope = Literal["user", "org"]
+ActionOrigin = Literal["native", "mcp"]
+
+
+class ActionDefinition(BaseModel):
+    name: str
+    description: str
+    input_schema: dict[str, Any] = Field(
+        default_factory=lambda: {"type": "object", "properties": {}}
+    )
+    mode: str = "write"  # "read" or "write"
+    credential_scope: ActionCredentialScope = "user"
+    # TODO: kept as list[str] on purpose — the SourceType enum lives in the Rust
+    # `shared` crate (source of truth) and we don't want to hand-mirror it here.
+    # Revisit if/when we generate Python types from the Rust models.
+    source_types: list[str] = Field(default_factory=list)
+    admin_only: bool = False
+    # Hidden from every chat/agent tool surface, admins included (unlike
+    # admin_only, not bypassed for admin users). Still dispatchable by name.
+    hidden: bool = False
+    # The connector enforces that this action only affects records within
+    # the caller's own authority (e.g. Darwinbox self-service writes), so it
+    # may run on the org credential for regular users.
+    actor_scoped: bool = False
+    # OAuth scopes required to invoke this action, when declared by the
+    # connector or its upstream MCP tool metadata.
+    # None means the connector has not declared action-level scopes and
+    # Omni should fall back to the coarse credential-existence check.
+    required_scopes: list[str] | None = None
+    # Provenance of this action: native actions are declared by the connector
+    # itself, mcp actions were discovered from its MCP server.
+    origin: ActionOrigin = "native"
+
+
+class SearchOperator(BaseModel):
+    operator: str
+    attribute_key: str
+    value_type: str = "text"  # "person", "text", "datetime"
+
+
+class McpResourceDefinition(BaseModel):
+    uri_template: str
+    name: str
+    description: str | None = None
+    mime_type: str | None = None
+
+
+class McpPromptArgument(BaseModel):
+    name: str
+    description: str | None = None
+    required: bool = False
+
+
+class McpPromptDefinition(BaseModel):
+    name: str
+    description: str | None = None
+    arguments: list[McpPromptArgument] = Field(default_factory=list)
+
+
+class ConnectorSkillDefinition(BaseModel):
+    id: str
+    title: str
+    description: str | None = None
+    source_types: list[str] = Field(default_factory=list)
+    content: str | None = None
+    mcp_prompt: str | None = None
+
+
+OAuthTokenEndpointAuthMethod = Literal[
+    "client_secret_post",
+    "client_secret_basic",
+    "none",
+]
+
+
+class OAuthScopeSet(BaseModel):
+    read: list[str] = Field(default_factory=list)
+    write: list[str] = Field(default_factory=list)
+
+
+class OAuthManifestConfig(BaseModel):
+    """Mirrors `shared::models::OAuthManifestConfig` (Rust). Pure data: a connector
+    declares this in its manifest and the web app's generic OAuth2 client uses it
+    to drive the standard authorization-code flow."""
+
+    provider: str
+    auth_endpoint: str
+    token_endpoint: str
+    userinfo_endpoint: str | None = None
+    userinfo_email_field: str = "email"
+    identity_scopes: list[str] = Field(default_factory=list)
+    scopes: dict[str, OAuthScopeSet] = Field(default_factory=dict)
+    extra_auth_params: dict[str, str] = Field(default_factory=dict)
+    scope_separator: str = " "
+    enrich_endpoint: str | None = None
+    registration_endpoint: str | None = Field(
+        default=None,
+        description=(
+            "OAuth Dynamic Client Registration endpoint. Set this for providers "
+            "where Omni may auto-create a client after any required admin "
+            "registration authorization is configured."
+        ),
+    )
+    registration_requires_initial_access_token: bool = Field(
+        default=False,
+        description=(
+            "Whether dynamic registration requires an administrator-provided "
+            "initial access token."
+        ),
+    )
+    token_response_fields: list[str] = Field(
+        default_factory=list,
+        description="Additional token response fields to preserve in credentials.",
+    )
+    token_endpoint_auth_method: OAuthTokenEndpointAuthMethod = Field(
+        default="client_secret_post",
+        description=(
+            "OAuth token endpoint client authentication method. Public DCR "
+            "clients usually use 'none'. Confidential DCR clients must return "
+            "a client secret and use client_secret_post or client_secret_basic."
+        ),
+    )
+    resource: str | None = Field(
+        default=None,
+        description=(
+            "Optional OAuth resource indicator (RFC 8707) sent on auth/token "
+            "requests for providers that bind tokens to a specific resource, "
+            "such as a remote MCP server."
+        ),
+    )
+    issuer_source_config_key: str | None = Field(
+        default=None,
+        description=(
+            "Optional source config key containing an OAuth issuer URL. The web "
+            "OAuth client uses standard OpenID Connect discovery when present."
+        ),
+    )
+    client_config_provider_template: str | None = Field(
+        default=None,
+        description=(
+            "Optional template for source-scoped OAuth client configuration. "
+            "The {source_id} placeholder is replaced for a persisted source."
+        ),
+    )
+    pkce_required: bool = Field(
+        default=False,
+        description="Whether authorization requests must use PKCE.",
+    )
+    grant_types: list[str] | None = Field(
+        default=None,
+        description="Optional OAuth Dynamic Client Registration grant types.",
+    )
+    validate_endpoint_urls: bool = Field(
+        default=False,
+        description=(
+            "Whether OAuth endpoints from this manifest require SSRF-safe URL "
+            "validation before server-side requests."
+        ),
+    )
+    supports_org_oauth: bool = Field(
+        default=True,
+        description="Whether this connector supports OAuth credentials for org sources.",
+    )
+
+
+class ConnectorSourceCapabilities(BaseModel):
+    source_id: str
+    actions: list[ActionDefinition] = Field(default_factory=list)
+    resources: list[McpResourceDefinition] = Field(default_factory=list)
+    prompts: list[McpPromptDefinition] = Field(default_factory=list)
+    skills: list[ConnectorSkillDefinition] = Field(default_factory=list)
+
+
+class ConnectorManifest(BaseModel):
+    name: str
+    display_name: str
+    version: str
+    sync_modes: list[str]
+    connector_id: str
+    connector_url: str
+    source_types: list[str] = Field(default_factory=list)
+    description: str | None = None
+    # Deprecated compatibility catalog. New and migrated connectors should
+    # publish actions in source_capabilities; source-specific definitions win
+    # over a legacy definition with the same name for that source.
+    actions: list[ActionDefinition] = Field(default_factory=list)
+    search_operators: list[SearchOperator] = Field(default_factory=list)
+    extra_schema: dict[str, Any] | None = None
+    attributes_schema: dict[str, Any] | None = None
+    mcp_enabled: bool = False
+    mcp_catalog_loaded: bool = Field(
+        default=False,
+        description="True when the connector has an MCP catalog available from live discovery.",
+    )
+    resources: list[McpResourceDefinition] = Field(default_factory=list)
+    prompts: list[McpPromptDefinition] = Field(default_factory=list)
+    skills: list[ConnectorSkillDefinition] = Field(default_factory=list)
+    source_capabilities: list[ConnectorSourceCapabilities] = Field(default_factory=list)
+    oauth: OAuthManifestConfig | None = None
+
+
+class ManifestSourceContext(BaseModel):
+    """Non-secret context carried by the manager's GET /manifest request."""
+
+    id: str
+    source_type: str
+    config: dict[str, Any]
+    updated_at: datetime
+
+
+class OAuthCredentialReadyRequest(BaseModel):
+    """Notification sent to a connector after OAuth credentials are stored.
+
+    Connector-manager resolves credentials from its store and includes them here
+    so connectors can run provider-specific post-OAuth setup, such as
+    authenticated MCP catalog discovery.
+    """
+
+    source_id: str = Field(
+        description="Source whose OAuth credential became available."
+    )
+    user_id: str | None = Field(
+        default=None,
+        description="User that owns the OAuth credential, or None for org-source credentials.",
+    )
+    provider: str = Field(
+        description="Service provider identifier for the OAuth credential."
+    )
+    flow: str = Field(
+        description="OAuth flow that stored the credential, such as user_read."
+    )
+    credentials: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Resolved credential payload forwarded by connector-manager.",
+    )
+
+
+class SkillResponse(BaseModel):
+    skill_id: str
+    title: str
+    content: str
+
+
+class SyncRequest(BaseModel):
+    sync_run_id: str
+    source_id: str
+    sync_mode: str
+    checkpoint: dict[str, Any] | None = None
+    is_resume: bool = False
+    # Manager's running tally at dispatch time. Zero on a fresh sync;
+    # non-zero on resume so the connector can keep counting from there.
+    documents_scanned: int = 0
+    documents_updated: int = 0
+
+
+class SyncResponse(BaseModel):
+    status: str
+    message: str | None = None
+
+    @classmethod
+    def started(cls) -> "SyncResponse":
+        return cls(status="started")
+
+    @classmethod
+    def error(cls, message: str) -> "SyncResponse":
+        return cls(status="error", message=message)
+
+
+class CancelRequest(BaseModel):
+    sync_run_id: str
+
+
+class CancelResponse(BaseModel):
+    status: str
+
+
+def _normalize_rust_datetime(value: object) -> object:
+    """Normalize time's expanded four-digit year representation for datetime."""
+    if not isinstance(value, str) or not value.startswith("+"):
+        return value
+    year_text, separator, remainder = value.partition("-")
+    if separator != "-" or len(year_text) != 7 or not year_text[1:].isdigit():
+        return value
+    year = int(year_text[1:])
+    return f"{year:04d}-{remainder}" if 1 <= year <= 9999 else value
+
+
+class Source(BaseModel):
+    id: str
+    name: str
+    source_type: str
+    config: dict[str, Any]
+    is_active: bool
+    is_deleted: bool
+    scope: str
+    user_filter_mode: UserFilterMode = UserFilterMode.ALL
+    user_whitelist: list[str] | None = None
+    user_blacklist: list[str] | None = None
+    connector_state: dict[str, Any] | None = None
+    checkpoint: dict[str, Any] | None = None
+    sync_interval_seconds: int | None = None
+    created_at: datetime
+    updated_at: datetime
+    created_by: str
+
+    _normalize_created_at = field_validator("created_at", mode="before")(_normalize_rust_datetime)
+    _normalize_updated_at = field_validator("updated_at", mode="before")(_normalize_rust_datetime)
+
+
+class SkillRequest(BaseModel):
+    skill_id: str
+    arguments: dict[str, Any] | None = None
+    credentials: dict[str, Any] = Field(default_factory=dict)
+    source: Source | None = None
+
+
+class ActionRequest(BaseModel):
+    action: str
+    params: dict[str, Any]
+    credentials: dict[str, Any]
+    source: Source | None = None
+    actor_email: str | None = None
+    actor_user_id: str | None = None
+
+
+class OAuthCredentialFlow(str, Enum):
+    """Which web OAuth flow produced the credential being validated."""
+
+    ORG_SOURCE = "org_source"
+    CONNECT_SOURCE = "connect_source"
+    USER_READ = "user_read"
+    USER_WRITE = "user_write"
+
+
+# Provider-defined identity binding returned by a connector's OAuth credential
+# validation (e.g. Salesforce ``organization_id``). Mirrors
+# `shared::models::OAuthSourceBinding` (Rust). Stored verbatim under the
+# reserved `source_binding` key in source config; never merged into other
+# config keys.
+OAuthSourceBinding = dict[str, str]
+
+
+class OAuthCredentialValidationRequest(BaseModel):
+    source_id: str
+    provider: str
+    credentials: dict[str, Any]
+    flow: OAuthCredentialFlow
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    source: Source | None = None
+
+
+class OAuthCredentialValidationResponse(BaseModel):
+    source_binding: dict[str, str] | None = None
+
+
+class ActionResponse(BaseModel):
+    status: str
+    result: dict[str, Any] | None = None
+    error: str | None = None
+
+    @classmethod
+    def success(cls, result: dict[str, Any]) -> "ActionResponse":
+        return cls(status="success", result=result)
+
+    @classmethod
+    def failure(cls, error: str) -> Self:
+        return cls(status="error", error=error)
+
+    @classmethod
+    def not_supported(cls, action: str) -> Self:
+        return cls(status="error", error=f"Action not supported: {action}")
+
+    def to_response(self, status_code: int = 200) -> JSONResponse:
+        """Convert this ActionResponse into a Starlette JSONResponse."""
+        return JSONResponse(content=self.model_dump(), status_code=status_code)
+
+
+class ResourceRequest(BaseModel):
+    uri: str
+    credentials: dict[str, Any] = Field(default_factory=dict)
+    source: Source | None = None
+
+
+class PromptRequest(BaseModel):
+    name: str
+    arguments: dict[str, Any] | None = None
+    credentials: dict[str, Any] = Field(default_factory=dict)
+    source: Source | None = None
+
+
+class SdkSourceSyncData(BaseModel):
+    """Typed envelope for the connector-manager /sdk/source/{id}/sync-config response.
+
+    Matches the Rust SdkSourceSyncConfigResponse struct.
+    """
+
+    config: dict[str, Any]
+    credentials: dict[str, Any]
+    connector_state: dict[str, Any] | None = None
+    checkpoint: dict[str, Any] | None = None
+    source_type: str | None = None
+    user_filter_mode: UserFilterMode = UserFilterMode.ALL
+    user_whitelist: list[str] | None = None
+    user_blacklist: list[str] | None = None

@@ -1,0 +1,564 @@
+"""
+Gemini Provider — streams responses and normalizes them to Anthropic MessageStreamEvent format.
+
+Gemini 3 returns an opaque ``thought_signature`` on Parts that hold function calls (and
+on the leading text Part of a reasoning turn). The signature must be echoed back on the
+same Part on subsequent turns or the API rejects the request. To carry this through the
+provider-agnostic Anthropic-shaped pipeline, we attach the signature as an extra
+``_gemini_thought_signature`` field on the corresponding ``ToolUseBlock`` / ``TextBlock``
+— Anthropic's SDK types are configured with ``extra="allow"`` so the field round-trips
+through ``model_dump()`` and into the persisted message JSON. On replay,
+``_convert_messages_to_gemini`` reads it back and re-attaches it to the Gemini ``Part``.
+"""
+
+import base64
+import json
+import logging
+import time
+from collections.abc import AsyncIterator
+from typing import Any, ClassVar
+
+from google import genai
+from google.genai import types
+from google.genai.errors import APIError
+from anthropic.types import (
+    Message,
+    MessageDeltaUsage,
+    Usage,
+    RawMessageStartEvent,
+    RawMessageDeltaEvent,
+    RawContentBlockStartEvent,
+    RawContentBlockDeltaEvent,
+    RawContentBlockStopEvent,
+    RawMessageStopEvent,
+    ToolUseBlock,
+    TextBlock,
+    TextDelta,
+    InputJSONDelta,
+)
+from anthropic.types.message_stream_event import MessageStreamEvent
+from anthropic.types.raw_message_delta_event import Delta
+
+from . import ContextWindowInfo, LLMProvider, TokenUsage
+from .anthropic_message_adapter import extract_text_document
+from .types import ProviderError, ProviderType
+
+
+def _gemini_status_code(e: BaseException) -> int | None:
+    return e.code if isinstance(e, APIError) else None
+
+
+logger = logging.getLogger(__name__)
+
+THOUGHT_SIGNATURE_KEY = "_gemini_thought_signature"
+
+# Fields the Gemini Schema proto accepts and whose wire names match what the
+# genai SDK emits. The SDK validates `parameters` dicts into its `Schema` model
+# and serializes the request with model_dump()'s default by_alias=False, so any
+# Schema field whose Python name differs from its wire name (additionalProperties,
+# anyOf, minItems, ...) reaches the API in snake_case and is rejected with
+# "Unknown name \"additional_properties\" ... 400 INVALID_ARGUMENT". Connector
+# action schemas commonly declare `additionalProperties: false`, so we strip
+# every key outside this set before building FunctionDeclarations.
+_GEMINI_SCHEMA_SAFE_FIELDS = frozenset(
+    {
+        "type",
+        "format",
+        "description",
+        "nullable",
+        "enum",
+        "default",
+        "items",
+        "properties",
+        "required",
+        "minimum",
+        "maximum",
+        "example",
+        "pattern",
+        "title",
+        "ref",
+        "defs",
+    }
+)
+
+
+def _sanitize_schema_for_gemini(schema: Any) -> Any:
+    """Restrict a tool input_schema to keys Gemini's Schema proto can round-trip.
+
+    Recurses into ``properties`` (property names are preserved) and ``items``,
+    dropping JSON-Schema keywords the Gemini API does not accept and fields the
+    genai SDK serializes with snake_case names.
+    """
+    if isinstance(schema, dict):
+        sanitized: dict[str, Any] = {}
+        for key, value in schema.items():
+            if key not in _GEMINI_SCHEMA_SAFE_FIELDS:
+                continue
+            if key == "properties" and isinstance(value, dict):
+                sanitized[key] = {
+                    name: _sanitize_schema_for_gemini(prop_schema)
+                    for name, prop_schema in value.items()
+                }
+            else:
+                sanitized[key] = _sanitize_schema_for_gemini(value)
+        return sanitized
+    if isinstance(schema, list):
+        return [_sanitize_schema_for_gemini(item) for item in schema]
+    return schema
+
+
+def _convert_tools_to_gemini(tools: list[dict[str, Any]]) -> list[types.Tool]:
+    """Convert Anthropic tool schema to Gemini function declarations."""
+    declarations = []
+    for tool in tools:
+        declarations.append(
+            types.FunctionDeclaration(
+                name=tool["name"],
+                description=tool.get("description", ""),
+                parameters=_sanitize_schema_for_gemini(tool.get("input_schema")),
+            )
+        )
+    return [types.Tool(function_declarations=declarations)]
+
+
+def _extract_thought_signature(block: dict[str, Any]) -> bytes | None:
+    """Read and base64-decode the sidecar ``_gemini_thought_signature`` from a block."""
+    sig_b64 = block.get(THOUGHT_SIGNATURE_KEY)
+    if not sig_b64:
+        return None
+    return base64.b64decode(sig_b64)
+
+
+def _convert_messages_to_gemini(
+    messages: list[dict[str, Any]],
+) -> list[types.Content]:
+    """Convert Anthropic-style messages to Gemini Content format."""
+    gemini_contents = []
+
+    for msg in messages:
+        role = msg["role"]
+        gemini_role = "model" if role == "assistant" else "user"
+        content = msg.get("content", "")
+
+        if isinstance(content, str):
+            gemini_contents.append(
+                types.Content(role=gemini_role, parts=[types.Part(text=content)])
+            )
+            continue
+
+        if not isinstance(content, list):
+            gemini_contents.append(
+                types.Content(role=gemini_role, parts=[types.Part(text=str(content))])
+            )
+            continue
+
+        parts: list[types.Part] = []
+
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+
+            if block_type == "text":
+                text = block.get("text", "")
+                if not text:
+                    continue
+                sig = _extract_thought_signature(block)
+                parts.append(
+                    types.Part(text=text, thought_signature=sig)
+                    if sig
+                    else types.Part(text=text)
+                )
+
+            elif block_type == "document" and role == "user":
+                document_text = extract_text_document(block)
+                if document_text is not None:
+                    parts.append(types.Part(text=document_text))
+
+            elif block_type == "image" and role == "user":
+                source = block.get("source")
+                if isinstance(source, dict) and source.get("type") == "base64":
+                    media_type = source.get("media_type")
+                    data = source.get("data")
+                    if isinstance(media_type, str) and isinstance(data, str):
+                        parts.append(
+                            types.Part.from_bytes(
+                                data=base64.b64decode(data), mime_type=media_type
+                            )
+                        )
+
+            elif block_type == "tool_use":
+                sig = _extract_thought_signature(block)
+                parts.append(
+                    types.Part(
+                        function_call=types.FunctionCall(
+                            name=block["name"],
+                            args=block.get("input", {}),
+                        ),
+                        thought_signature=sig,
+                    )
+                    if sig
+                    else types.Part(
+                        function_call=types.FunctionCall(
+                            name=block["name"],
+                            args=block.get("input", {}),
+                        )
+                    )
+                )
+
+            elif block_type == "tool_result":
+                result_content = block.get("content", "")
+                if isinstance(result_content, list):
+                    text_parts = []
+                    for rb in result_content:
+                        if isinstance(rb, dict):
+                            if rb.get("type") == "text":
+                                text_parts.append(rb.get("text", ""))
+                            elif rb.get("type") == "search_result":
+                                title = rb.get("title", "")
+                                source = rb.get("source", "")
+                                inner = rb.get("content", [])
+                                inner_text = "\n".join(
+                                    ib.get("text", "")
+                                    for ib in inner
+                                    if isinstance(ib, dict) and ib.get("type") == "text"
+                                )
+                                text_parts.append(f"[{title}]({source})\n{inner_text}")
+                            elif rb.get("type") == "document":
+                                title = rb.get("title", "")
+                                source = rb.get("source", {})
+                                data = (
+                                    source.get("data", "")
+                                    if isinstance(source, dict)
+                                    else ""
+                                )
+                                text_parts.append(f"[{title}]\n{data}")
+                    result_content = "\n\n".join(text_parts)
+
+                tool_name = block.get("tool_use_id", "unknown")
+                for prev_msg in reversed(gemini_contents):
+                    if prev_msg.role == "model" and prev_msg.parts:
+                        for p in prev_msg.parts:
+                            if p.function_call and p.function_call.id == block.get(
+                                "tool_use_id"
+                            ):
+                                tool_name = p.function_call.name
+                                break
+                            if p.function_call:
+                                tool_name = p.function_call.name
+                        break
+
+                parts.append(
+                    types.Part(
+                        function_response=types.FunctionResponse(
+                            name=tool_name,
+                            response={"result": str(result_content)},
+                        )
+                    )
+                )
+
+        if parts:
+            gemini_contents.append(types.Content(role=gemini_role, parts=parts))
+
+    return gemini_contents
+
+
+class GeminiProvider(LLMProvider):
+    """Provider for Google Gemini API."""
+
+    provider_type: ClassVar[ProviderType] = ProviderType.GEMINI
+    PERSISTED_BLOCK_EXTRAS = (THOUGHT_SIGNATURE_KEY,)
+
+    def __init__(self, api_key: str, model: str):
+        self.api_key = api_key
+        self.client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(
+                retry_options=types.HttpRetryOptions(
+                    attempts=3,
+                    initial_delay=1.0,
+                    max_delay=30.0,
+                    exp_base=2.0,
+                    jitter=0.5,
+                    http_status_codes=[429, 500, 502, 503],
+                )
+            ),
+        )
+        self.model = model
+        self.model_name = model
+        self._context_window_info: ContextWindowInfo | None = None
+
+    async def get_context_window_tokens(self) -> ContextWindowInfo:
+        if self._context_window_info is not None:
+            return self._context_window_info
+        try:
+            model_info = await self.client.aio.models.get(model=self.model)
+            input_limit = model_info.input_token_limit
+            if isinstance(input_limit, int) and input_limit > 0:
+                self._context_window_info = ContextWindowInfo(
+                    tokens=input_limit, source="provider_metadata"
+                )
+                return self._context_window_info
+        except Exception as e:
+            logger.debug(
+                "Failed to fetch Gemini model metadata for %s: %s", self.model, e
+            )
+        self._context_window_info = await super().get_context_window_tokens()
+        return self._context_window_info
+
+    async def stream_response(
+        self,
+        prompt: str,
+        max_tokens: int | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        messages: list[dict[str, Any]] | None = None,
+        system_prompt: str | None = None,
+        *,
+        model: str | None = None,
+    ) -> AsyncIterator[MessageStreamEvent]:
+        """Stream response from Gemini, yielding Anthropic-compatible MessageStreamEvents."""
+        try:
+            active_model = model or self.model
+            contents = _convert_messages_to_gemini(
+                messages or [{"role": "user", "content": prompt}]
+            )
+
+            config = types.GenerateContentConfig(
+                max_output_tokens=max_tokens or 4096,
+            )
+
+            if system_prompt:
+                config.system_instruction = system_prompt
+
+            if tools:
+                config.tools = _convert_tools_to_gemini(tools)
+                logger.info(
+                    f"Sending request with {len(tools)} tools: {[t['name'] for t in tools]}"
+                )
+
+            logger.info(
+                f"Model: {active_model}, Messages: {len(contents)}, Max tokens: {config.max_output_tokens}"
+            )
+
+            # Emit message_start
+            yield RawMessageStartEvent(
+                type="message_start",
+                message=Message(
+                    id=str(time.time_ns()),
+                    type="message",
+                    role="assistant",
+                    content=[],
+                    model=active_model,
+                    usage=Usage(input_tokens=0, output_tokens=0),
+                ),
+            )
+
+            next_block_index = 0
+            text_started = False
+            current_text_index = 0
+            last_usage_metadata = None
+
+            async for chunk in await self.client.aio.models.generate_content_stream(
+                model=active_model,
+                contents=contents,
+                config=config,
+            ):
+                if hasattr(chunk, "usage_metadata") and chunk.usage_metadata:
+                    last_usage_metadata = chunk.usage_metadata
+
+                if not chunk.candidates:
+                    continue
+
+                candidate = chunk.candidates[0]
+                if not candidate.content or not candidate.content.parts:
+                    continue
+
+                for part in candidate.content.parts:
+                    # Gemini 3 may attach a thought_signature on text or function_call
+                    # parts. Encode once per Part — sidecar onto whichever primary
+                    # block this Part produces via Pydantic's extra="allow".
+                    sig_b64 = (
+                        base64.b64encode(part.thought_signature).decode("ascii")
+                        if part.thought_signature
+                        else None
+                    )
+
+                    # Handle text parts
+                    if part.text is not None:
+                        if not text_started:
+                            current_text_index = next_block_index
+                            next_block_index += 1
+                            text_started = True
+                            text_kwargs: dict[str, Any] = {"type": "text", "text": ""}
+                            if sig_b64:
+                                text_kwargs[THOUGHT_SIGNATURE_KEY] = sig_b64
+                            yield RawContentBlockStartEvent(
+                                type="content_block_start",
+                                index=current_text_index,
+                                content_block=TextBlock(**text_kwargs),
+                            )
+                        elif sig_b64:
+                            # Subsequent text parts with their own signatures can't
+                            # round-trip cleanly while we merge text into one block.
+                            logger.warning(
+                                "Dropping thought_signature on non-leading text Part "
+                                "(text-merging loses per-Part signatures)"
+                            )
+
+                        yield RawContentBlockDeltaEvent(
+                            type="content_block_delta",
+                            index=current_text_index,
+                            delta=TextDelta(type="text_delta", text=part.text),
+                        )
+
+                    # Handle function call parts
+                    elif part.function_call is not None:
+                        if text_started:
+                            yield RawContentBlockStopEvent(
+                                type="content_block_stop",
+                                index=current_text_index,
+                            )
+                            text_started = False
+
+                        block_index = next_block_index
+                        next_block_index += 1
+                        tool_call_id = f"toolu_{time.time_ns()}"
+
+                        tool_kwargs: dict[str, Any] = {
+                            "type": "tool_use",
+                            "id": tool_call_id,
+                            "name": part.function_call.name or "",
+                            "input": {},
+                        }
+                        if sig_b64:
+                            tool_kwargs[THOUGHT_SIGNATURE_KEY] = sig_b64
+
+                        yield RawContentBlockStartEvent(
+                            type="content_block_start",
+                            index=block_index,
+                            content_block=ToolUseBlock(**tool_kwargs),
+                        )
+
+                        args = part.function_call.args or {}
+                        if args:
+                            yield RawContentBlockDeltaEvent(
+                                type="content_block_delta",
+                                index=block_index,
+                                delta=InputJSONDelta(
+                                    type="input_json_delta",
+                                    partial_json=json.dumps(dict(args)),
+                                ),
+                            )
+                        yield RawContentBlockStopEvent(
+                            type="content_block_stop",
+                            index=block_index,
+                        )
+
+            if text_started:
+                yield RawContentBlockStopEvent(
+                    type="content_block_stop",
+                    index=current_text_index,
+                )
+
+            if last_usage_metadata:
+                prompt_tokens = (
+                    getattr(last_usage_metadata, "prompt_token_count", 0) or 0
+                )
+                output_tokens = (
+                    getattr(last_usage_metadata, "candidates_token_count", 0) or 0
+                )
+                cached_tokens = (
+                    getattr(last_usage_metadata, "cached_content_token_count", 0) or 0
+                )
+                yield RawMessageDeltaEvent(
+                    type="message_delta",
+                    delta=Delta(stop_reason="end_turn"),
+                    usage=MessageDeltaUsage(
+                        # prompt_token_count is the TOTAL prompt size and
+                        # includes the cached portion; report only the
+                        # uncached input so cached tokens are not double
+                        # counted against cache_read_input_tokens.
+                        input_tokens=max(prompt_tokens - cached_tokens, 0),
+                        output_tokens=output_tokens,
+                        cache_read_input_tokens=cached_tokens,
+                    ),
+                )
+
+            yield RawMessageStopEvent(type="message_stop")
+
+        except Exception as e:
+            logger.error(f"Failed to stream from Gemini: {str(e)}", exc_info=True)
+            raise ProviderError(
+                str(e),
+                provider_type=self.provider_type,
+                model=model or self.model_name,
+                status_code=_gemini_status_code(e),
+                cause=e,
+            ) from e
+
+    async def generate_response(
+        self,
+        prompt: str,
+        max_tokens: int | None = None,
+        *,
+        model: str | None = None,
+    ) -> tuple[str, TokenUsage]:
+        """Generate non-streaming response from Gemini."""
+        try:
+            active_model = model or self.model
+            config = types.GenerateContentConfig(
+                max_output_tokens=max_tokens or 4096,
+            )
+
+            response = await self.client.aio.models.generate_content(
+                model=active_model,
+                contents=prompt,
+                config=config,
+            )
+
+            usage = TokenUsage()
+            if hasattr(response, "usage_metadata") and response.usage_metadata:
+                um = response.usage_metadata
+                prompt_tokens = getattr(um, "prompt_token_count", 0) or 0
+                cached_tokens = getattr(um, "cached_content_token_count", 0) or 0
+                usage = TokenUsage(
+                    # prompt_token_count includes the cached portion; report
+                    # only the uncached input (same accounting as the stream
+                    # path above).
+                    input_tokens=max(prompt_tokens - cached_tokens, 0),
+                    output_tokens=getattr(um, "candidates_token_count", 0) or 0,
+                    cache_read_tokens=cached_tokens,
+                )
+
+            if not response.text:
+                raise Exception("Empty response from Gemini")
+
+            return response.text, usage
+
+        except Exception as e:
+            logger.error(f"Failed to generate response: {str(e)}")
+            raise ProviderError(
+                str(e),
+                provider_type=self.provider_type,
+                model=model or self.model_name,
+                status_code=_gemini_status_code(e),
+                cause=e,
+            ) from e
+
+    async def health_check(
+        self,
+        *,
+        model: str | None = None,
+    ) -> bool:
+        """Check if Gemini API is accessible."""
+        try:
+            active_model = model or self.model
+            config = types.GenerateContentConfig(max_output_tokens=1)
+            await self.client.aio.models.generate_content(
+                model=active_model,
+                contents="Hello",
+                config=config,
+            )
+            return True
+        except Exception:
+            return False

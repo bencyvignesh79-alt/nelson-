@@ -1,0 +1,352 @@
+import { SdkClientError, ConfigurationError } from './errors.js';
+import {
+  SdkSourceSyncDataSchema,
+  serializeConnectorEvent,
+  type ConnectorEventPayload,
+  type ConnectorManifest,
+  type SdkSourceSyncData,
+} from './models.js';
+
+export class SdkClient {
+  private readonly baseUrl: string;
+  private readonly timeout: number;
+
+  constructor(baseUrl?: string, timeout = 30000) {
+    const url = baseUrl ?? process.env.CONNECTOR_MANAGER_URL;
+    if (!url) {
+      throw new ConfigurationError('CONNECTOR_MANAGER_URL environment variable not set');
+    }
+    this.baseUrl = url.replace(/\/$/, '');
+    this.timeout = timeout;
+  }
+
+  static fromEnv(): SdkClient {
+    return new SdkClient();
+  }
+
+  async emitEvent(
+    syncRunId: string,
+    sourceId: string,
+    event: ConnectorEventPayload
+  ): Promise<void> {
+    const payload = {
+      sync_run_id: syncRunId,
+      source_id: sourceId,
+      event: serializeConnectorEvent(event),
+    };
+
+    const response = await this.post('/sdk/events', payload);
+    if (!response.ok) {
+      const text = await response.text();
+      throw new SdkClientError(
+        `Failed to emit event: ${response.status} - ${text}`,
+        response.status
+      );
+    }
+  }
+
+  async emitEventBatch(
+    syncRunId: string,
+    sourceId: string,
+    events: ConnectorEventPayload[]
+  ): Promise<void> {
+    if (events.length === 0) {
+      return;
+    }
+
+    const payload = {
+      sync_run_id: syncRunId,
+      source_id: sourceId,
+      events: events.map((e) => serializeConnectorEvent(e)),
+    };
+
+    const response = await this.post('/sdk/events/batch', payload);
+    if (!response.ok) {
+      const text = await response.text();
+      throw new SdkClientError(
+        `Failed to emit event batch (${events.length} events): ${response.status} - ${text}`,
+        response.status
+      );
+    }
+  }
+
+  async extractAndStoreContent(
+    syncRunId: string,
+    data: Buffer | Uint8Array,
+    mimeType: string,
+    filename?: string
+  ): Promise<string> {
+    const formData = new FormData();
+    formData.append('sync_run_id', syncRunId);
+    formData.append('mime_type', mimeType);
+    formData.append('data', new Blob([data]), 'file');
+    if (filename) {
+      formData.append('filename', filename);
+    }
+
+    const url = `${this.baseUrl}/sdk/extract-content`;
+    const response = await fetch(url, {
+      method: 'POST',
+      body: formData,
+      signal: AbortSignal.timeout(this.timeout),
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new SdkClientError(
+        `Failed to extract content: ${response.status} - ${text}`,
+        response.status
+      );
+    }
+
+    const result = (await response.json()) as { content_id: string };
+    return result.content_id;
+  }
+
+  async extractText(
+    syncRunId: string,
+    data: Buffer | Uint8Array,
+    mimeType: string,
+    filename?: string
+  ): Promise<string> {
+    const formData = new FormData();
+    formData.append('sync_run_id', syncRunId);
+    formData.append('mime_type', mimeType);
+    formData.append('data', new Blob([data]), 'file');
+    if (filename) {
+      formData.append('filename', filename);
+    }
+
+    const url = `${this.baseUrl}/sdk/extract-text`;
+    const response = await fetch(url, {
+      method: 'POST',
+      body: formData,
+      signal: AbortSignal.timeout(this.timeout),
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new SdkClientError(
+        `Failed to extract text: ${response.status} - ${text}`,
+        response.status
+      );
+    }
+
+    const result = (await response.json()) as { text: string };
+    return result.text;
+  }
+
+  async storeContent(
+    syncRunId: string,
+    content: string,
+    contentType = 'text/plain'
+  ): Promise<string> {
+    const payload = {
+      sync_run_id: syncRunId,
+      content,
+      content_type: contentType,
+    };
+
+    const response = await this.post('/sdk/content', payload);
+    if (!response.ok) {
+      const text = await response.text();
+      throw new SdkClientError(
+        `Failed to store content: ${response.status} - ${text}`,
+        response.status
+      );
+    }
+
+    const data = (await response.json()) as { content_id: string };
+    return data.content_id;
+  }
+
+  async updateCheckpoint(
+    syncRunId: string,
+    checkpoint: Record<string, unknown>
+  ): Promise<void> {
+    const response = await this.put(
+      `/sdk/sync/${syncRunId}/checkpoint`,
+      checkpoint
+    );
+    if (!response.ok) {
+      const text = await response.text();
+      throw new SdkClientError(
+        `Failed to update checkpoint: ${response.status} - ${text}`,
+        response.status
+      );
+    }
+  }
+
+  async updateConnectorState(
+    sourceId: string,
+    state: Record<string, unknown>
+  ): Promise<void> {
+    const response = await this.put(
+      `/sdk/source/${sourceId}/connector-state`,
+      state
+    );
+    if (!response.ok) {
+      const text = await response.text();
+      throw new SdkClientError(
+        `Failed to update connector state: ${response.status} - ${text}`,
+        response.status
+      );
+    }
+  }
+
+  async heartbeat(syncRunId: string): Promise<void> {
+    const response = await this.post(`/sdk/sync/${syncRunId}/heartbeat`);
+    if (!response.ok) {
+      const text = await response.text();
+      throw new SdkClientError(
+        `Failed to heartbeat: ${response.status} - ${text}`,
+        response.status
+      );
+    }
+  }
+
+  async incrementScanned(syncRunId: string): Promise<void> {
+    const response = await this.post(`/sdk/sync/${syncRunId}/scanned`, {
+      count: 1,
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      throw new SdkClientError(
+        `Failed to increment scanned: ${response.status} - ${text}`,
+        response.status
+      );
+    }
+  }
+
+  async incrementUpdated(syncRunId: string, count: number): Promise<void> {
+    const response = await this.post(`/sdk/sync/${syncRunId}/updated`, { count });
+    if (!response.ok) {
+      const text = await response.text();
+      throw new SdkClientError(
+        `Failed to increment updated: ${response.status} - ${text}`,
+        response.status
+      );
+    }
+  }
+
+  async complete(syncRunId: string): Promise<void> {
+    const response = await this.post(`/sdk/sync/${syncRunId}/complete`);
+    if (!response.ok) {
+      const text = await response.text();
+      throw new SdkClientError(
+        `Failed to complete: ${response.status} - ${text}`,
+        response.status
+      );
+    }
+  }
+
+  async fail(syncRunId: string, error: string): Promise<void> {
+    const response = await this.post(`/sdk/sync/${syncRunId}/fail`, { error });
+    if (!response.ok) {
+      const text = await response.text();
+      throw new SdkClientError(
+        `Failed to mark as failed: ${response.status} - ${text}`,
+        response.status
+      );
+    }
+  }
+
+  async register(manifest: ConnectorManifest): Promise<void> {
+    const response = await this.post('/sdk/register', manifest);
+    if (!response.ok) {
+      const text = await response.text();
+      throw new SdkClientError(
+        `Failed to register: ${response.status} - ${text}`,
+        response.status
+      );
+    }
+  }
+
+  async fetchSourceConfig(sourceId: string): Promise<SdkSourceSyncData> {
+    const response = await this.get(`/sdk/source/${sourceId}/sync-config`);
+    if (!response.ok) {
+      const text = await response.text();
+      throw new SdkClientError(
+        `Failed to fetch source config: ${response.status} - ${text}`,
+        response.status
+      );
+    }
+    const raw = (await response.json()) as unknown;
+    return SdkSourceSyncDataSchema.parse(raw);
+  }
+
+  /// Fetch the admin-managed connector config for a provider (stored in the
+  /// `connector_configs` table). Returns an empty object when the provider
+  /// has no config row yet — that's a valid "not configured" state, not an
+  /// error.
+  async getConnectorConfig(provider: string): Promise<Record<string, unknown>> {
+    const response = await this.get(`/sdk/connector-configs/${provider}`);
+    if (!response.ok) {
+      if (response.status === 404) return {};
+      const text = await response.text();
+      throw new SdkClientError(
+        `Failed to fetch connector config: ${response.status} - ${text}`,
+        response.status
+      );
+    }
+    const raw = (await response.json()) as unknown;
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+      throw new SdkClientError(`Invalid connector config response for provider: ${provider}`);
+    }
+    return raw as Record<string, unknown>;
+  }
+
+  async getUserEmailForSource(sourceId: string): Promise<string> {
+    const response = await this.get(`/sdk/source/${sourceId}/user-email`);
+    if (!response.ok) {
+      const text = await response.text();
+      throw new SdkClientError(
+        `Failed to get user email for source: ${response.status} - ${text}`,
+        response.status
+      );
+    }
+    const result = (await response.json()) as { email?: unknown };
+    if (typeof result.email !== 'string' || result.email.length === 0) {
+      throw new SdkClientError('Failed to get user email for source: invalid response');
+    }
+    return result.email;
+  }
+
+  private async get(path: string): Promise<Response> {
+    const url = `${this.baseUrl}${path}`;
+    return fetch(url, {
+      method: 'GET',
+      signal: AbortSignal.timeout(this.timeout),
+    });
+  }
+
+  private async put(path: string, body?: unknown): Promise<Response> {
+    const url = `${this.baseUrl}${path}`;
+    const options: RequestInit = {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      signal: AbortSignal.timeout(this.timeout),
+    };
+    if (body !== undefined) {
+      options.body = JSON.stringify(body);
+    }
+    return fetch(url, options);
+  }
+
+  private async post(path: string, body?: unknown): Promise<Response> {
+    const url = `${this.baseUrl}${path}`;
+    const options: RequestInit = {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      signal: AbortSignal.timeout(this.timeout),
+    };
+    if (body !== undefined) {
+      options.body = JSON.stringify(body);
+    }
+    return fetch(url, options);
+  }
+}

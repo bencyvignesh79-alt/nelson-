@@ -1,0 +1,467 @@
+"""Unit tests for MetaToolHandler discovery/loading behavior."""
+
+from __future__ import annotations
+
+import pytest
+
+from tools.connector_handler import ConnectorAction, ConnectorToolHandler
+from tools.meta_handler import MetaToolHandler
+from tools.registry import ToolContext
+from tools.searcher_client import CapabilitySearchResponse, CapabilitySearchResult
+
+
+def _make_action(
+    source_id: str,
+    source_type: str,
+    action_name: str,
+    description: str = "",
+    source_name: str | None = None,
+    mode: str = "write",
+) -> ConnectorAction:
+    return ConnectorAction(
+        source_id=source_id,
+        source_type=source_type,
+        source_name=source_name or source_type,
+        action_name=action_name,
+        description=description,
+        input_schema={"type": "object", "properties": {}},
+        mode=mode,
+    )
+
+
+def _make_handler(
+    actions: list[ConnectorAction],
+    *,
+    source_filter: dict[str, list[str]] | None = None,
+    action_whitelist: list[str] | None = None,
+) -> ConnectorToolHandler:
+    handler = ConnectorToolHandler(
+        connector_manager_url="http://unused",
+        user_id="u1",
+        source_filter=source_filter,
+        action_whitelist=action_whitelist,
+    )
+    handler._build_tools(actions)
+    handler._initialized = True
+    return handler
+
+
+def _ctx() -> ToolContext:
+    return ToolContext(chat_id="c1", user_id="u1")
+
+
+class _FakeSearcherClient:
+    def __init__(self, tool_names: list[str] | None = None) -> None:
+        self.upserts = []
+        self.searches = []
+        self.tool_names = ["gmail__send_email"] if tool_names is None else tool_names
+
+    async def upsert_capabilities(self, request):
+        self.upserts.append(request)
+        return type("Resp", (), {"upserted": len(request.capabilities)})()
+
+    async def sync_capabilities(self, request):
+        self.upserts.append(request)
+        return type("Resp", (), {"upserted": len(request.capabilities), "deleted": 0})()
+
+    async def search_capabilities(self, request):
+        self.searches.append(request)
+        return CapabilitySearchResponse(
+            results=[
+                CapabilitySearchResult(
+                    id=f"tool:{tool_name}",
+                    capability_type="tool",
+                    name=tool_name,
+                    description=f"Description for {tool_name}.",
+                    search_text=tool_name.replace("__", " ").replace("_", " "),
+                    data={"tool_name": tool_name},
+                    score=1.0,
+                )
+                for tool_name in self.tool_names[: request.limit]
+            ]
+        )
+
+
+@pytest.fixture
+def actions() -> list[ConnectorAction]:
+    return [
+        _make_action(
+            "src-gmail-1",
+            "gmail",
+            "send_email",
+            "Send an email via Gmail.",
+            "Work Gmail",
+        ),
+        _make_action(
+            "src-gmail-1",
+            "gmail",
+            "list_threads",
+            "List recent email threads.",
+            "Work Gmail",
+        ),
+        _make_action(
+            "src-outlook-1", "outlook", "send_email", "Send an email via Outlook."
+        ),
+        _make_action(
+            "src-drive-1", "google_drive", "create_doc", "Create a Google Doc."
+        ),
+        _make_action(
+            "src-slack-1", "slack", "post_message", "Post a message in Slack."
+        ),
+    ]
+
+
+def test_load_tool_set_schema_avoids_unsupported_combinators(actions):
+    handler = _make_handler(actions)
+    meta = MetaToolHandler(handler, set(), lambda _: None)
+
+    load_tool_set = next(tool for tool in meta.get_tools() if tool["name"] == "load_tool_set")
+
+    assert "oneOf" not in load_tool_set["input_schema"]
+    assert "anyOf" not in load_tool_set["input_schema"]
+    assert "allOf" not in load_tool_set["input_schema"]
+
+
+@pytest.mark.asyncio
+async def test_tool_search_returns_matches_without_loading(actions):
+    handler = _make_handler(actions)
+    loaded: set[str] = set()
+    fired: list[set[str]] = []
+
+    async def on_load(newly: set[str]) -> None:
+        fired.append(newly)
+
+    searcher = _FakeSearcherClient(["gmail__send_email", "outlook__send_email"])
+    meta = MetaToolHandler(handler, loaded, on_load, searcher_client=searcher)
+    result = await meta.execute("tool_search", {"query": "email"}, _ctx())
+
+    assert not result.is_error
+    text = result.content[0]["text"]
+    assert "Found" in text
+    assert "gmail__send_email" in text
+    assert "outlook__send_email" in text
+    assert "load_tool" in text
+    assert loaded == set()
+    assert fired == []
+
+
+@pytest.mark.asyncio
+async def test_tool_search_loads_unique_exact_action_name_match(actions):
+    handler = _make_handler(actions)
+    loaded: set[str] = set()
+    fired: list[set[str]] = []
+
+    async def on_load(newly: set[str]) -> None:
+        fired.append(newly)
+
+    searcher = _FakeSearcherClient(["gmail__list_threads"])
+    meta = MetaToolHandler(handler, loaded, on_load, searcher_client=searcher)
+    result = await meta.execute("tool_search", {"query": "list_threads"}, _ctx())
+
+    assert not result.is_error
+    assert loaded == {"gmail__list_threads"}
+    assert fired == [{"gmail__list_threads"}]
+    assert "Exact match loaded and now callable: gmail__list_threads" in result.content[
+        0
+    ]["text"]
+
+
+@pytest.mark.asyncio
+async def test_tool_search_loads_all_tools_for_exact_source_match(actions):
+    handler = _make_handler(actions)
+    loaded: set[str] = set()
+    fired: list[set[str]] = []
+
+    async def on_load(newly: set[str]) -> None:
+        fired.append(newly)
+
+    searcher = _FakeSearcherClient(["gmail__send_email"])
+    meta = MetaToolHandler(handler, loaded, on_load, searcher_client=searcher)
+    result = await meta.execute("tool_search", {"query": "gmail"}, _ctx())
+
+    gmail_tools = {"gmail__send_email", "gmail__list_threads"}
+    assert not result.is_error
+    assert loaded == gmail_tools
+    assert fired == [gmail_tools]
+    assert "Exact match loaded and now callable: 2 matching source tools" in result.content[
+        0
+    ]["text"]
+
+
+@pytest.mark.asyncio
+async def test_tool_search_uses_searcher_without_loading(actions):
+    handler = _make_handler(actions)
+    loaded: set[str] = set()
+    searcher = _FakeSearcherClient()
+    meta = MetaToolHandler(handler, loaded, lambda _: None, searcher_client=searcher)
+    await meta.publish_tool_capabilities()
+
+    result = await meta.execute("tool_search", {"query": "email"}, _ctx())
+
+    assert not result.is_error
+    assert "gmail__send_email" in result.content[0]["text"]
+    assert loaded == set()
+    assert searcher.upserts
+    assert {cap.id for cap in searcher.upserts[0].capabilities} >= {
+        "tool:gmail__send_email",
+        "tool:gmail__list_threads",
+    }
+    assert searcher.searches[0].capability_type == "tool"
+    assert "tool:gmail__send_email" in searcher.searches[0].allowed_ids
+
+
+@pytest.mark.asyncio
+async def test_publish_tool_capabilities_skips_unchanged_refresh(actions):
+    handler = _make_handler(actions)
+    searcher = _FakeSearcherClient()
+    meta = MetaToolHandler(handler, set(), lambda _: None, searcher_client=searcher)
+
+    await meta.publish_tool_capabilities()
+    await meta.publish_tool_capabilities()
+
+    assert len(searcher.upserts) == 4
+    assert {call.publisher_id for call in searcher.upserts} == {
+        "src-gmail-1",
+        "src-outlook-1",
+        "src-drive-1",
+        "src-slack-1",
+    }
+
+
+@pytest.mark.asyncio
+async def test_publish_tool_capabilities_groups_by_publisher():
+    many_actions = [
+        _make_action(
+            f"src-{idx}",
+            f"source_{idx}",
+            "do_work",
+            f"Do work {idx}.",
+        )
+        for idx in range(501)
+    ]
+    handler = _make_handler(many_actions)
+    searcher = _FakeSearcherClient()
+    meta = MetaToolHandler(handler, set(), lambda _: None, searcher_client=searcher)
+
+    await meta.publish_tool_capabilities()
+
+    assert len(searcher.upserts) == 501
+    assert all(len(call.capabilities) == 1 for call in searcher.upserts)
+
+
+@pytest.mark.asyncio
+async def test_tool_search_no_matches_returns_no_load(actions):
+    handler = _make_handler(actions)
+    loaded: set[str] = set()
+    meta = MetaToolHandler(
+        handler, loaded, lambda _: None, searcher_client=_FakeSearcherClient([])
+    )
+
+    result = await meta.execute("tool_search", {"query": "xyzwhatever"}, _ctx())
+
+    assert not result.is_error
+    assert "No tools matched" in result.content[0]["text"]
+    assert loaded == set()
+
+
+@pytest.mark.asyncio
+async def test_tool_search_respects_limit(actions):
+    handler = _make_handler(actions)
+    meta = MetaToolHandler(
+        handler,
+        set(),
+        lambda _: None,
+        searcher_client=_FakeSearcherClient(
+            ["gmail__send_email", "outlook__send_email"]
+        ),
+    )
+
+    result = await meta.execute(
+        "tool_search", {"query": "send email", "limit": 1}, _ctx()
+    )
+
+    assert not result.is_error
+    lines = [
+        line for line in result.content[0]["text"].splitlines() if line.startswith("-")
+    ]
+    assert len(lines) == 1
+
+
+@pytest.mark.asyncio
+async def test_load_tool_loads_one_exact_tool(actions):
+    handler = _make_handler(actions)
+    loaded: set[str] = set()
+    fired: list[set[str]] = []
+
+    async def on_load(newly: set[str]) -> None:
+        fired.append(newly)
+
+    meta = MetaToolHandler(handler, loaded, on_load)
+    result = await meta.execute("load_tool", {"tool_name": "gmail__send_email"}, _ctx())
+
+    assert not result.is_error
+    assert loaded == {"gmail__send_email"}
+    assert fired == [{"gmail__send_email"}]
+    assert "Loaded tool: gmail__send_email" in result.content[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_load_tool_unknown_tool_errors(actions):
+    handler = _make_handler(actions)
+    meta = MetaToolHandler(handler, set(), lambda _: None)
+
+    result = await meta.execute("load_tool", {"tool_name": "missing_tool"}, _ctx())
+
+    assert result.is_error
+    assert "Unknown tool" in result.content[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_load_tool_set_by_source_type_loads_all_matching_tools(actions):
+    handler = _make_handler(actions)
+    loaded: set[str] = set()
+    fired: list[set[str]] = []
+
+    async def on_load(newly: set[str]) -> None:
+        fired.append(newly)
+
+    meta = MetaToolHandler(handler, loaded, on_load)
+    result = await meta.execute("load_tool_set", {"source_type": "gmail"}, _ctx())
+
+    assert not result.is_error
+    assert loaded == {"gmail__send_email", "gmail__list_threads"}
+    assert fired == [{"gmail__send_email", "gmail__list_threads"}]
+    text = result.content[0]["text"]
+    assert "gmail__send_email" in text
+    assert "gmail__list_threads" in text
+
+
+@pytest.mark.asyncio
+async def test_load_tool_set_by_source_id_loads_matching_tools(actions):
+    handler = _make_handler(actions)
+    loaded: set[str] = set()
+    meta = MetaToolHandler(handler, loaded, lambda _: None)
+
+    result = await meta.execute("load_tool_set", {"source_id": "src-drive-1"}, _ctx())
+
+    assert not result.is_error
+    assert loaded == {"google_drive__create_doc"}
+
+
+@pytest.mark.asyncio
+async def test_load_tool_set_unknown_source_errors(actions):
+    handler = _make_handler(actions)
+    meta = MetaToolHandler(handler, set(), lambda _: None)
+    result = await meta.execute("load_tool_set", {"source_type": "nonexistent"}, _ctx())
+    assert result.is_error
+
+
+@pytest.mark.asyncio
+async def test_load_tool_set_already_loaded_skips_persist(actions):
+    handler = _make_handler(actions)
+    loaded: set[str] = {"gmail__send_email", "gmail__list_threads"}
+    fired: list[set[str]] = []
+
+    async def on_load(newly: set[str]) -> None:
+        fired.append(newly)
+
+    meta = MetaToolHandler(handler, loaded, on_load)
+    result = await meta.execute("load_tool_set", {"source_type": "gmail"}, _ctx())
+
+    assert not result.is_error
+    assert fired == []
+    assert "already loaded" in result.content[0]["text"].lower()
+
+
+def test_filtered_tools_returns_only_loaded_tool_names(actions):
+    handler = _make_handler(actions)
+
+    assert handler.filtered_tools(set()) == []
+
+    names = {t["name"] for t in handler.filtered_tools({"gmail__send_email"})}
+    assert names == {"gmail__send_email"}
+
+    multi_names = {
+        t["name"]
+        for t in handler.filtered_tools(
+            {"gmail__send_email", "google_drive__create_doc"}
+        )
+    }
+    assert multi_names == {"gmail__send_email", "google_drive__create_doc"}
+
+
+def test_source_filter_limits_actions_by_source_and_mode():
+    actions = [
+        _make_action("src-gmail", "gmail", "send_email", mode="write"),
+        _make_action("src-gmail", "gmail", "list_threads", mode="read"),
+        _make_action("src-drive", "google_drive", "fetch_file", mode="read"),
+    ]
+
+    handler = _make_handler(actions, source_filter={"src-gmail": ["read"]})
+
+    assert set(handler.actions) == {"gmail__list_threads"}
+    assert handler.requires_approval("gmail__list_threads") is False
+    assert {tool["name"] for tool in handler.get_tools()} == {"gmail__list_threads"}
+
+
+def test_action_whitelist_limits_actions_by_namespaced_tool_name():
+    actions = [
+        _make_action("src-gmail", "gmail", "send_email", mode="write"),
+        _make_action("src-gmail", "gmail", "list_threads", mode="read"),
+    ]
+
+    handler = _make_handler(actions, action_whitelist=["gmail__list_threads"])
+
+    assert set(handler.actions) == {"gmail__list_threads"}
+    assert handler.requires_approval("gmail__list_threads") is False
+    assert {tool["name"] for tool in handler.get_tools()} == {"gmail__list_threads"}
+
+
+def test_list_toolsets_groups_by_source(actions):
+    handler = _make_handler(actions)
+    toolsets = handler.list_toolsets()
+
+    by_source = {ts["source_id"]: ts for ts in toolsets}
+    assert by_source["src-gmail-1"]["tool_count"] == 2
+    assert by_source["src-gmail-1"]["source_type"] == "gmail"
+    assert by_source["src-outlook-1"]["tool_count"] == 1
+    assert by_source["src-drive-1"]["source_type"] == "google_drive"
+    assert "list_threads" in by_source["src-gmail-1"]["sample_tool_names"]
+    assert "send_email" in by_source["src-gmail-1"]["sample_tool_names"]
+
+
+def test_duplicate_source_type_actions_are_not_dropped():
+    actions = [
+        _make_action(
+            "src-gmail-work",
+            "gmail",
+            "send_email",
+            "Send from work Gmail.",
+            "Work Gmail",
+        ),
+        _make_action(
+            "src-gmail-personal",
+            "gmail",
+            "send_email",
+            "Send from personal Gmail.",
+            "Personal Gmail",
+        ),
+    ]
+    handler = _make_handler(actions)
+
+    toolsets = handler.list_toolsets()
+    assert {ts["source_id"] for ts in toolsets} == {
+        "src-gmail-work",
+        "src-gmail-personal",
+    }
+
+    work_names = {t["name"] for t in handler.filtered_tools({"gmail__send_email"})}
+    personal_names = {
+        t["name"]
+        for t in handler.filtered_tools(
+            {"gmail__send_email__source_src_gmail_personal"}
+        )
+    }
+
+    assert work_names == {"gmail__send_email"}
+    assert personal_names == {"gmail__send_email__source_src_gmail_personal"}

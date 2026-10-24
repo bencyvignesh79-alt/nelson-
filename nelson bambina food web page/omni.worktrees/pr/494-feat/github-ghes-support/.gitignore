@@ -1,0 +1,11 @@
+target/
+**/node_modules/
+**/dist/
+.env
+benchmarks/benchmarks
+benchmarks/data
+benchmarks/results
+venv/
+.venv/
+__pycache__/
+omni-sa-key.json

@@ -1,0 +1,115 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omni-ai"
+version = "0.1.0"
+description = "Omni AI Service - LLM and Embedding Provider Gateway"
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn>=0.34.0",
+    "pydantic>=2.11.0",
+    "httpx>=0.28.0",
+    "anthropic>=0.68.0",
+    "boto3>=1.40.0",
+    "openai>=1.82.0",
+    "transformers>=4.52.0",
+    "asyncpg>=0.30.0",
+    "python-ulid>=3.1.0",
+    "opentelemetry-api>=1.29.0",
+    "opentelemetry-sdk>=1.29.0",
+    "opentelemetry-exporter-otlp>=1.29.0",
+    "opentelemetry-instrumentation-fastapi>=0.50b0",
+    "opentelemetry-instrumentation-httpx>=0.50b0",
+    "mem0ai>=2.0.0",
+    "pgvector>=0.4.2",
+    "psycopg[binary,pool]>=3.2",
+    "redis>=5.0.0",
+    "cohere>=5.20.4",
+    "google-genai>=1.0.0",
+    "azure-identity>=1.19.0",
+    "azure-communication-email>=1.0.0",
+    "aiosmtplib>=3.0.0",
+    "croniter>=2.0.0",
+    "python-multipart>=0.0.31",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+pythonpath = ["."]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--tb=short",
+    "--strict-markers",
+]
+markers = [
+    "unit: Unit tests (no external dependencies)",
+    "integration: Integration tests (require DB/Redis)",
+    "slow: Slow tests (skip with -m 'not slow')",
+    "real_llm: Tests against real LLM APIs (require API keys in .env)",
+]
+
+[tool.coverage.run]
+source = ["schemas", "services", "processing", "routers", "providers", "embeddings"]
+omit = ["tests/*", "*/__init__.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]  # Line length handled separately
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+    "schemas*",
+    "services*",
+    "processing*",
+    "routers*",
+    "providers*",
+    "embeddings*",
+    "tools*",
+    "db*",
+    "models*",
+    "logger*",
+    "agents*",
+    "email_service*",
+    "web_providers*",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=4.1.0",
+    "testcontainers>=4.0.0",
+    "respx>=0.21.0",
+    "requests>=2.32.0",
+    "ruff>=0.4.0",
+    "mypy>=1.10.0",
+    "pyright>=1.1.408",
+]

@@ -1,0 +1,104 @@
+import { env } from '$env/dynamic/private'
+import type { SearchResponse, SearchRequest } from '$lib/types/search.js'
+import { logger } from '$lib/server/logger'
+
+export const load = async ({ url, fetch, locals }) => {
+    const query = url.searchParams.get('q')
+    const aiAnswerEnabled = env.AI_ANSWER_ENABLED !== 'false' // Default to true if not set
+
+    // Parse source_type filter from URL params (can be multiple)
+    const sourceTypes = url.searchParams.getAll('source_type')
+    const page = Math.max(1, parseInt(url.searchParams.get('page') || '1'))
+    const PAGE_SIZE = 20
+
+    if (!query || query.trim() === '') {
+        return {
+            searchResults: null,
+            sources: null,
+            aiAnswerEnabled,
+            selectedSourceTypes: sourceTypes,
+            currentPage: 1,
+            pageSize: PAGE_SIZE,
+        }
+    }
+
+    try {
+        // Fetch search results and sources in parallel
+        const [searchResponse, sourcesResponse] = await Promise.all([
+            // Search request
+            fetch(`${env.SEARCHER_URL}/search`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    query: query.trim(),
+                    limit: PAGE_SIZE,
+                    offset: (page - 1) * PAGE_SIZE,
+                    mode: 'hybrid',
+                    user_id: locals.user?.id,
+                    user_email: locals.user?.email,
+                    user_configuration: locals.user?.configuration,
+                    source_types: sourceTypes.length > 0 ? sourceTypes : undefined,
+                } as SearchRequest),
+            }),
+            // Sources request
+            fetch('/api/sources', {
+                method: 'GET',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+            }),
+        ])
+
+        logger.debug('Search response', { searchResponse, sourcesResponse })
+
+        if (!searchResponse.ok) {
+            logger.error('Search request failed', {
+                status: searchResponse.status,
+                statusText: searchResponse.statusText,
+            })
+            return {
+                searchResults: null,
+                sources: null,
+                error: 'Search service unavailable',
+                aiAnswerEnabled,
+                selectedSourceTypes: sourceTypes,
+                currentPage: page,
+                pageSize: PAGE_SIZE,
+            }
+        }
+
+        const searchResults: SearchResponse = await searchResponse.json()
+        let sources = null
+
+        if (sourcesResponse.ok) {
+            sources = await sourcesResponse.json()
+        } else {
+            logger.warn('Sources request failed', {
+                status: sourcesResponse.status,
+                statusText: sourcesResponse.statusText,
+            })
+        }
+
+        return {
+            searchResults,
+            sources,
+            aiAnswerEnabled,
+            selectedSourceTypes: sourceTypes,
+            currentPage: page,
+            pageSize: PAGE_SIZE,
+        }
+    } catch (err) {
+        logger.error('Error performing search:', err)
+        return {
+            searchResults: null,
+            sources: null,
+            error: 'Failed to perform search',
+            aiAnswerEnabled,
+            selectedSourceTypes: sourceTypes,
+            currentPage: page,
+            pageSize: PAGE_SIZE,
+        }
+    }
+}

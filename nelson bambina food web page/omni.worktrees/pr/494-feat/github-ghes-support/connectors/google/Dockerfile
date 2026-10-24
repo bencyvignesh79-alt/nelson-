@@ -1,0 +1,57 @@
+# Multi-stage build for Google connector service
+FROM lukemathwalker/cargo-chef:latest-rust-1.91.1-bookworm AS chef
+WORKDIR /app
+
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+ARG BUILD_MODE=release
+COPY --from=planner /app/recipe.json recipe.json
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install the Google Workspace CLI used by the connector's action bridge.
+RUN cargo install --git https://github.com/googleworkspace/cli --locked
+
+# Cook dependencies based on build mode
+RUN if [ "$BUILD_MODE" = "debug" ]; then \
+        cargo chef cook --recipe-path recipe.json; \
+    else \
+        cargo chef cook --release --recipe-path recipe.json; \
+    fi
+
+COPY Cargo.toml Cargo.lock ./
+COPY shared/ shared/
+COPY sdk/rust/ sdk/rust/
+COPY connectors/google/ connectors/google/
+
+# Build binary based on build mode
+RUN if [ "$BUILD_MODE" = "debug" ]; then \
+        cargo build --bin omni-google-connector; \
+    else \
+        cargo build --release --bin omni-google-connector; \
+    fi
+
+FROM debian:bookworm-slim AS runtime
+ARG BUILD_MODE=release
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy binary based on build mode
+RUN if [ "$BUILD_MODE" = "debug" ]; then \
+        echo "Debug mode - binary will be copied from target/debug/"; \
+    else \
+        echo "Release mode - binary will be copied from target/release/"; \
+    fi
+
+COPY --from=builder /app/target/${BUILD_MODE}/omni-google-connector /usr/local/bin/omni-google-connector
+COPY --from=builder /usr/local/cargo/bin/gws /usr/local/bin/gws
+
+CMD ["omni-google-connector"]

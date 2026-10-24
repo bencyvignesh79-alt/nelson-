@@ -1,0 +1,502 @@
+"""
+OpenAI Provider — streams responses and normalizes them to Anthropic MessageStreamEvent format.
+
+Uses the OpenAI Responses API (client.responses.create).
+"""
+
+import json
+import logging
+from collections.abc import AsyncIterator
+from typing import Any, ClassVar
+
+from openai import APIStatusError, AsyncOpenAI
+from anthropic.types import (
+    Message,
+    MessageDeltaUsage,
+    Usage,
+    RawMessageStartEvent,
+    RawMessageDeltaEvent,
+    RawContentBlockStartEvent,
+    RawContentBlockDeltaEvent,
+    RawContentBlockStopEvent,
+    RawMessageStopEvent,
+    ToolUseBlock,
+    TextBlock,
+    TextDelta,
+    InputJSONDelta,
+)
+from anthropic.types.message_stream_event import MessageStreamEvent
+from anthropic.types.raw_message_delta_event import Delta
+
+from . import LLMProvider, TokenUsage
+from .anthropic_message_adapter import extract_text_document
+from .types import ProviderError, ProviderType
+
+
+def _openai_status_code(e: BaseException) -> int | None:
+    return e.status_code if isinstance(e, APIStatusError) else None
+
+
+def _openai_error_code(e: BaseException) -> str | None:
+    code = getattr(e, "code", None)
+    if isinstance(code, str):
+        return code
+    body = getattr(e, "body", None)
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict):
+            body_code = error.get("code")
+            if isinstance(body_code, str):
+                return body_code
+    return None
+
+
+def _openai_context_overflow(e: BaseException) -> bool:
+    return _openai_error_code(e) == "context_length_exceeded"
+
+
+logger = logging.getLogger(__name__)
+
+MIN_REASONING_OUTPUT_TOKENS = 1024
+
+
+def _is_reasoning_model(model: str) -> bool:
+    normalized = model.lower()
+    return normalized.startswith(("gpt-5", "o1", "o3", "o4"))
+
+
+def _effective_max_output_tokens(model: str, max_tokens: int | None) -> int:
+    tokens = max_tokens or 4096
+    if _is_reasoning_model(model):
+        return max(tokens, MIN_REASONING_OUTPUT_TOKENS)
+    return tokens
+
+
+def _convert_tools_to_openai(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert Anthropic tool schema to OpenAI Responses API function-calling format (flat)."""
+    return [
+        {
+            "type": "function",
+            "name": tool["name"],
+            "description": tool.get("description", ""),
+            "parameters": tool["input_schema"],
+        }
+        for tool in tools
+    ]
+
+
+class OpenAIProvider(LLMProvider):
+    """Provider for OpenAI API (GPT-4, etc.) using the Responses API."""
+
+    provider_type: ClassVar[ProviderType] = ProviderType.OPENAI
+
+    def __init__(self, api_key: str, model: str):
+        self.api_key = api_key
+        self.client = AsyncOpenAI(api_key=api_key)
+        self.model = model
+        self.model_name = model
+
+    async def stream_response(
+        self,
+        prompt: str,
+        max_tokens: int | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        messages: list[dict[str, Any]] | None = None,
+        system_prompt: str | None = None,
+        *,
+        model: str | None = None,
+    ) -> AsyncIterator[MessageStreamEvent]:
+        """Stream response from OpenAI Responses API, yielding Anthropic-compatible MessageStreamEvents."""
+        try:
+            active_model = model or self.model
+            input_items = self._convert_messages(
+                messages or [{"role": "user", "content": prompt}]
+            )
+
+            request_params: dict[str, Any] = {
+                "model": active_model,
+                "input": input_items,
+                "max_output_tokens": _effective_max_output_tokens(
+                    active_model, max_tokens
+                ),
+                "stream": True,
+            }
+
+            if system_prompt:
+                request_params["instructions"] = system_prompt
+
+            if tools:
+                request_params["tools"] = _convert_tools_to_openai(tools)
+                logger.info(
+                    f"Sending request with {len(tools)} tools: {[t['name'] for t in tools]}"
+                )
+
+            logger.info(
+                f"Model: {active_model}, Input items: {len(input_items)}, Max tokens: {request_params['max_output_tokens']}"
+            )
+
+            stream = await self.client.responses.create(**request_params)
+
+            text_started = False
+            current_text_index = 0
+            tool_call_indices: dict[str, int] = {}  # item_id -> content block index
+            next_block_index = 0
+
+            async for event in stream:
+                event_type = event.type
+
+                # Handle response.created — emit message_start with real ID/model
+                if event_type == "response.created":
+                    resp_usage = getattr(event.response, "usage", None)
+                    input_tokens = (
+                        getattr(resp_usage, "input_tokens", 0) if resp_usage else 0
+                    )
+                    yield RawMessageStartEvent(
+                        type="message_start",
+                        message=Message(
+                            id=event.response.id,
+                            type="message",
+                            role="assistant",
+                            content=[],
+                            model=event.response.model,
+                            usage=Usage(input_tokens=input_tokens, output_tokens=0),
+                        ),
+                    )
+                    continue
+
+                # Handle text deltas
+                if event_type == "response.output_text.delta":
+                    if not text_started:
+                        current_text_index = next_block_index
+                        next_block_index += 1
+                        text_started = True
+                        yield RawContentBlockStartEvent(
+                            type="content_block_start",
+                            index=current_text_index,
+                            content_block=TextBlock(type="text", text=""),
+                        )
+
+                    yield RawContentBlockDeltaEvent(
+                        type="content_block_delta",
+                        index=current_text_index,
+                        delta=TextDelta(type="text_delta", text=event.delta),
+                    )
+
+                # Handle tool call start
+                elif event_type == "response.output_item.added":
+                    item = event.item
+                    if item.type == "function_call":
+                        if item.id is None:
+                            logger.warning(
+                                f"Received function_call item with no id (call_id={item.call_id}); skipping tool block"
+                            )
+                        else:
+                            block_index = next_block_index
+                            next_block_index += 1
+                            tool_call_indices[item.id] = block_index
+                            yield RawContentBlockStartEvent(
+                                type="content_block_start",
+                                index=block_index,
+                                content_block=ToolUseBlock(
+                                    type="tool_use",
+                                    id=item.call_id,
+                                    name=item.name,
+                                    input={},
+                                ),
+                            )
+
+                # Handle tool call argument deltas
+                elif event_type == "response.function_call_arguments.delta":
+                    call_id = event.item_id
+                    if call_id in tool_call_indices:
+                        yield RawContentBlockDeltaEvent(
+                            type="content_block_delta",
+                            index=tool_call_indices[call_id],
+                            delta=InputJSONDelta(
+                                type="input_json_delta",
+                                partial_json=event.delta,
+                            ),
+                        )
+
+                # Handle text block done
+                elif event_type == "response.output_text.done":
+                    if text_started:
+                        yield RawContentBlockStopEvent(
+                            type="content_block_stop",
+                            index=current_text_index,
+                        )
+                        text_started = False
+
+                # Handle tool block done
+                elif event_type == "response.output_item.done":
+                    item = event.item
+                    if item.type == "function_call" and item.id in tool_call_indices:
+                        yield RawContentBlockStopEvent(
+                            type="content_block_stop",
+                            index=tool_call_indices[item.id],
+                        )
+
+                # Handle completion — extract usage
+                elif event_type == "response.completed":
+                    resp_usage = getattr(event.response, "usage", None)
+                    if resp_usage:
+                        input_tokens = getattr(resp_usage, "input_tokens", 0) or 0
+                        output_tokens = getattr(resp_usage, "output_tokens", 0) or 0
+                        details = getattr(resp_usage, "input_tokens_details", None)
+                        cached_tokens = (
+                            (getattr(details, "cached_tokens", 0) or 0)
+                            if details
+                            else 0
+                        )
+                        yield RawMessageDeltaEvent(
+                            type="message_delta",
+                            delta=Delta(stop_reason="end_turn"),
+                            usage=MessageDeltaUsage(
+                                input_tokens=input_tokens,
+                                output_tokens=output_tokens,
+                                cache_read_input_tokens=cached_tokens,
+                            ),
+                        )
+                    break
+
+                # Handle incomplete response (max_output_tokens exhausted mid-stream)
+                elif event_type == "response.incomplete":
+                    resp_usage = getattr(event.response, "usage", None)
+                    if resp_usage:
+                        input_tokens = getattr(resp_usage, "input_tokens", 0) or 0
+                        output_tokens = getattr(resp_usage, "output_tokens", 0) or 0
+                        details = getattr(resp_usage, "input_tokens_details", None)
+                        cached_tokens = (
+                            (getattr(details, "cached_tokens", 0) or 0)
+                            if details
+                            else 0
+                        )
+                        yield RawMessageDeltaEvent(
+                            type="message_delta",
+                            delta=Delta(stop_reason="max_tokens"),
+                            usage=MessageDeltaUsage(
+                                input_tokens=input_tokens,
+                                output_tokens=output_tokens,
+                                cache_read_input_tokens=cached_tokens,
+                            ),
+                        )
+                    break
+
+                # Handle explicit failure events
+                elif event_type == "response.failed":
+                    error = getattr(event.response, "error", None)
+                    msg = getattr(error, "message", None) or "Response failed"
+                    code = getattr(error, "code", None)
+                    raise ProviderError(
+                        msg,
+                        provider_type=self.provider_type,
+                        model=model or self.model_name,
+                        is_context_overflow=code == "context_length_exceeded",
+                    )
+
+                elif event_type == "error":
+                    raise RuntimeError(getattr(event, "message", "Unknown stream error"))
+
+            yield RawMessageStopEvent(type="message_stop")
+
+        except ProviderError:
+            raise
+        except Exception as e:
+            logger.error(f"Failed to stream from OpenAI: {str(e)}", exc_info=True)
+            raise ProviderError(
+                str(e),
+                provider_type=self.provider_type,
+                model=model or self.model_name,
+                status_code=_openai_status_code(e),
+                cause=e,
+                is_context_overflow=_openai_context_overflow(e),
+            ) from e
+
+    def _convert_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Convert Anthropic-style messages to OpenAI Responses API input items."""
+        input_items: list[dict[str, Any]] = []
+        for msg in messages:
+            role = msg["role"]
+            content = msg.get("content", "")
+
+            if isinstance(content, str):
+                input_items.append({"role": role, "content": content})
+                continue
+
+            if not isinstance(content, list):
+                input_items.append({"role": role, "content": str(content)})
+                continue
+
+            # Handle block-based content
+            text_parts = []
+            tool_calls = []
+            tool_results = []
+
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                block_type = block.get("type")
+
+                if block_type == "text":
+                    text = block.get("text", "")
+                    if text:
+                        text_parts.append(text)
+                elif block_type == "document" and role == "user":
+                    document_text = extract_text_document(block)
+                    if document_text is not None:
+                        text_parts.append(document_text)
+                elif block_type == "tool_use":
+                    tool_calls.append(
+                        {
+                            "type": "function_call",
+                            "call_id": block["id"],
+                            "name": block["name"],
+                            "arguments": (
+                                json.dumps(block["input"])
+                                if isinstance(block["input"], dict)
+                                else str(block["input"])
+                            ),
+                        }
+                    )
+                elif block_type == "tool_result":
+                    result_content = block.get("content", "")
+                    if isinstance(result_content, list):
+                        parts = []
+                        for rb in result_content:
+                            if isinstance(rb, dict):
+                                if rb.get("type") == "text":
+                                    t = rb.get("text", "")
+                                    if t:
+                                        parts.append(t)
+                                elif rb.get("type") == "search_result":
+                                    title = rb.get("title", "")
+                                    source = rb.get("source", "")
+                                    inner = rb.get("content", [])
+                                    inner_text = "\n".join(
+                                        ib.get("text", "")
+                                        for ib in inner
+                                        if isinstance(ib, dict)
+                                        and ib.get("type") == "text"
+                                    )
+                                    parts.append(f"[{title}]({source})\n{inner_text}")
+                                elif rb.get("type") == "document":
+                                    title = rb.get("title", "")
+                                    source = rb.get("source", {})
+                                    data = (
+                                        source.get("data", "")
+                                        if isinstance(source, dict)
+                                        else ""
+                                    )
+                                    parts.append(f"[{title}]\n{data}")
+                        result_content = "\n\n".join(parts)
+                    tool_results.append(
+                        {
+                            "type": "function_call_output",
+                            "call_id": block.get("tool_use_id", ""),
+                            "output": str(result_content),
+                        }
+                    )
+
+            if role == "assistant":
+                if text_parts:
+                    input_items.append(
+                        {"role": "assistant", "content": "\n".join(text_parts)}
+                    )
+                for tc in tool_calls:
+                    input_items.append(tc)
+            elif role == "user" and tool_results:
+                if text_parts:
+                    input_items.append({"role": role, "content": "\n".join(text_parts)})
+                for tr in tool_results:
+                    input_items.append(tr)
+            else:
+                if text_parts:
+                    input_items.append({"role": role, "content": "\n".join(text_parts)})
+
+        return input_items
+
+    async def generate_response(
+        self,
+        prompt: str,
+        max_tokens: int | None = None,
+        *,
+        model: str | None = None,
+    ) -> tuple[str, TokenUsage]:
+        """Generate non-streaming response from OpenAI Responses API."""
+        try:
+            active_model = model or self.model
+            # Reasoning models consume their internal reasoning chain against
+            # max_output_tokens before producing any visible text. Enforce a
+            # minimum so short utility calls, like title generation, still have
+            # room to write an answer.
+            effective_max_tokens = _effective_max_output_tokens(
+                active_model, max_tokens
+            )
+            params: dict[str, Any] = {
+                "model": active_model,
+                "input": prompt,
+                "max_output_tokens": effective_max_tokens,
+                "stream": False,
+            }
+
+            response = await self.client.responses.create(**params)
+
+            usage = TokenUsage()
+            resp_usage = getattr(response, "usage", None)
+            if resp_usage:
+                details = getattr(resp_usage, "input_tokens_details", None)
+                cached_tokens = (
+                    (getattr(details, "cached_tokens", 0) or 0) if details else 0
+                )
+                usage = TokenUsage(
+                    input_tokens=getattr(resp_usage, "input_tokens", 0) or 0,
+                    output_tokens=getattr(resp_usage, "output_tokens", 0) or 0,
+                    cache_read_tokens=cached_tokens,
+                )
+
+            status = getattr(response, "status", None)
+            if status == "incomplete":
+                raise Exception(
+                    f"Response was incomplete (max_output_tokens={effective_max_tokens} exhausted)"
+                )
+            if status == "failed":
+                error = getattr(response, "error", None)
+                msg = getattr(error, "message", None) or "Response failed"
+                raise Exception(msg)
+            if status == "cancelled":
+                raise Exception("Response was cancelled")
+
+            content = response.output_text
+            if not content:
+                raise Exception("Empty response from OpenAI")
+
+            return content, usage
+
+        except Exception as e:
+            logger.error(f"Failed to generate response: {str(e)}")
+            raise ProviderError(
+                str(e),
+                provider_type=self.provider_type,
+                model=model or self.model_name,
+                status_code=_openai_status_code(e),
+                cause=e,
+                is_context_overflow=_openai_context_overflow(e),
+            ) from e
+
+    async def health_check(
+        self,
+        *,
+        model: str | None = None,
+    ) -> bool:
+        """Check if OpenAI API is accessible."""
+        try:
+            active_model = model or self.model
+            await self.client.responses.create(
+                model=active_model,
+                input="Hello",
+                max_output_tokens=_effective_max_output_tokens(active_model, 16),
+                stream=False,
+            )
+            return True
+        except Exception:
+            return False

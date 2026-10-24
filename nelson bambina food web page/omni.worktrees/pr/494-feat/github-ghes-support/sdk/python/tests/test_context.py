@@ -1,0 +1,401 @@
+import json
+
+import pytest
+
+from omni_connector import (
+    Document,
+    DocumentMetadata,
+    DocumentPermissions,
+    PersonSyncRecord,
+    SyncContext,
+    UserFilterMode,
+)
+
+
+@pytest.mark.asyncio
+async def test_emit_creates_document_created_event(sdk_client, mock_connector_manager):
+    """Verify emit() creates a properly structured document_created event."""
+    ctx = SyncContext(
+        sdk_client=sdk_client,
+        sync_run_id="sync-run-123",
+        source_id="source-456",
+    )
+
+    doc = Document(
+        external_id="doc-external-id",
+        title="My Document Title",
+        content_id="content-789",
+        metadata=DocumentMetadata(
+            author="author@example.com",
+            url="https://example.com/doc",
+        ),
+        permissions=DocumentPermissions(
+            public=False,
+            users=["user1@example.com", "user2@example.com"],
+        ),
+        attributes={"department": "engineering"},
+    )
+
+    await ctx.emit(doc)
+    await ctx.flush()
+
+    # Verify the event payload
+    call = mock_connector_manager.calls[0]
+    payload = json.loads(call.request.content)
+
+    assert payload["sync_run_id"] == "sync-run-123"
+    assert payload["source_id"] == "source-456"
+
+    event = payload["events"][0]
+    assert event["type"] == "document_created"
+    assert event["document_id"] == "doc-external-id"
+    assert event["content_id"] == "content-789"
+    assert event["metadata"]["author"] == "author@example.com"
+    assert event["metadata"]["url"] == "https://example.com/doc"
+    assert event["permissions"]["public"] is False
+    assert event["permissions"]["users"] == ["user1@example.com", "user2@example.com"]
+    assert event["attributes"]["department"] == "engineering"
+
+
+@pytest.mark.asyncio
+async def test_emit_updated_creates_document_updated_event(
+    sdk_client, mock_connector_manager
+):
+    """Verify emit_updated() creates a document_updated event."""
+    ctx = SyncContext(
+        sdk_client=sdk_client,
+        sync_run_id="sync-123",
+        source_id="source-456",
+    )
+
+    doc = Document(
+        external_id="doc-123",
+        title="Updated Title",
+        content_id="new-content-id",
+    )
+
+    await ctx.emit_updated(doc)
+    await ctx.flush()
+
+    payload = json.loads(mock_connector_manager.calls[0].request.content)
+    assert payload["events"][0]["type"] == "document_updated"
+    assert payload["events"][0]["document_id"] == "doc-123"
+    assert payload["events"][0]["content_id"] == "new-content-id"
+
+
+@pytest.mark.asyncio
+async def test_emit_deleted_creates_document_deleted_event(
+    sdk_client, mock_connector_manager
+):
+    """Verify emit_deleted() creates a minimal document_deleted event."""
+    ctx = SyncContext(
+        sdk_client=sdk_client,
+        sync_run_id="sync-123",
+        source_id="source-456",
+    )
+
+    await ctx.emit_deleted("doc-to-remove")
+    await ctx.flush()
+
+    payload = json.loads(mock_connector_manager.calls[0].request.content)
+    event = payload["events"][0]
+
+    assert event["type"] == "document_deleted"
+    assert event["document_id"] == "doc-to-remove"
+    assert event["sync_run_id"] == "sync-123"
+    assert event["source_id"] == "source-456"
+    # Deleted events should not have content/metadata
+    assert "content_id" not in event
+    assert "metadata" not in event
+
+
+@pytest.mark.asyncio
+async def test_complete_sends_correct_counts(sdk_client, mock_connector_manager):
+    """Verify complete() sends accurate document counts."""
+    ctx = SyncContext(
+        sdk_client=sdk_client,
+        sync_run_id="sync-123",
+        source_id="source-456",
+    )
+
+    # Simulate scanning and emitting
+    for i in range(5):
+        await ctx.increment_scanned()
+
+    doc = Document(external_id="doc-1", title="Doc", content_id="c1")
+    await ctx.emit(doc)
+    await ctx.emit(doc)
+    await ctx.emit(doc)
+
+    await ctx.complete(checkpoint={"cursor": "final"})
+
+    # Find the complete call (last one)
+    complete_calls = [
+        c for c in mock_connector_manager.calls if "complete" in str(c.request.url)
+    ]
+    assert len(complete_calls) == 1
+
+    payload = json.loads(complete_calls[0].request.content)
+    assert payload["documents_scanned"] == 5
+    assert payload["documents_updated"] == 3  # 3 emits
+
+    checkpoint_calls = [
+        c
+        for c in mock_connector_manager.calls
+        if "checkpoint" in str(c.request.url)
+    ]
+    assert json.loads(checkpoint_calls[0].request.content) == {"cursor": "final"}
+
+
+@pytest.mark.asyncio
+async def test_fail_sends_error_message(sdk_client, mock_connector_manager):
+    """Verify fail() sends the error message."""
+    ctx = SyncContext(
+        sdk_client=sdk_client,
+        sync_run_id="sync-123",
+        source_id="source-456",
+    )
+
+    await ctx.fail("API rate limit exceeded")
+
+    fail_calls = [
+        c for c in mock_connector_manager.calls if "fail" in str(c.request.url)
+    ]
+    payload = json.loads(fail_calls[0].request.content)
+    assert payload["error"] == "API rate limit exceeded"
+
+
+@pytest.mark.asyncio
+async def test_save_checkpoint_persists_and_heartbeats(
+    sdk_client, mock_connector_manager
+):
+    """Verify save_checkpoint() persists checkpoint and triggers a heartbeat."""
+    ctx = SyncContext(
+        sdk_client=sdk_client,
+        sync_run_id="sync-123",
+        source_id="source-456",
+        checkpoint={"page": 1},
+    )
+
+    await ctx.save_checkpoint({"page": 2, "cursor": "abc"})
+
+    checkpoint_calls = [
+        c
+        for c in mock_connector_manager.calls
+        if "checkpoint" in str(c.request.url)
+    ]
+    assert len(checkpoint_calls) == 1
+    assert "sync-123" in str(checkpoint_calls[0].request.url)
+    assert checkpoint_calls[0].request.method == "PUT"
+    assert json.loads(checkpoint_calls[0].request.content) == {
+        "page": 2,
+        "cursor": "abc",
+    }
+
+    heartbeat_calls = [
+        c for c in mock_connector_manager.calls if "heartbeat" in str(c.request.url)
+    ]
+    assert len(heartbeat_calls) == 1
+    assert "sync-123" in str(heartbeat_calls[0].request.url)
+
+    # Checkpoint should be updated locally
+    assert ctx.checkpoint == {"page": 2, "cursor": "abc"}
+
+
+@pytest.mark.asyncio
+async def test_content_storage_save(sdk_client, mock_connector_manager):
+    """Verify content_storage.save() stores content and returns ID."""
+    ctx = SyncContext(
+        sdk_client=sdk_client,
+        sync_run_id="sync-123",
+        source_id="source-456",
+    )
+
+    content_id = await ctx.content_storage.save(
+        "<html><body>Hello World</body></html>",
+        "text/html",
+    )
+
+    assert content_id == "test-content-id-123"
+
+    # Verify the content was sent correctly
+    content_calls = [
+        c for c in mock_connector_manager.calls if "/sdk/content" in str(c.request.url)
+    ]
+    payload = json.loads(content_calls[0].request.content)
+    assert payload["content"] == "<html><body>Hello World</body></html>"
+    assert payload["content_type"] == "text/html"
+    assert payload["sync_run_id"] == "sync-123"
+
+
+@pytest.mark.asyncio
+async def test_content_storage_save_bytes(sdk_client, mock_connector_manager):
+    """Verify content_storage.save() handles bytes input."""
+    ctx = SyncContext(
+        sdk_client=sdk_client,
+        sync_run_id="sync-123",
+        source_id="source-456",
+    )
+
+    content_id = await ctx.content_storage.save(
+        b"Binary content as bytes",
+        "text/plain",
+    )
+
+    assert content_id == "test-content-id-123"
+
+    content_calls = [
+        c for c in mock_connector_manager.calls if "/sdk/content" in str(c.request.url)
+    ]
+    payload = json.loads(content_calls[0].request.content)
+    assert payload["content"] == "Binary content as bytes"
+
+
+def test_cancellation_flag():
+    """Verify cancellation flag works correctly."""
+    from omni_connector import SdkClient
+
+    # Create a mock client (won't be used)
+    class MockClient:
+        base_url = "http://test"
+
+    ctx = SyncContext(
+        sdk_client=MockClient(),  # type: ignore
+        sync_run_id="sync-123",
+        source_id="source-456",
+    )
+
+    assert ctx.is_cancelled() is False
+
+    ctx._set_cancelled()
+
+    assert ctx.is_cancelled() is True
+
+
+def test_context_exposes_properties():
+    """Verify context properties are accessible."""
+
+    class MockClient:
+        base_url = "http://test"
+
+    ctx = SyncContext(
+        sdk_client=MockClient(),  # type: ignore
+        sync_run_id="sync-run-id",
+        source_id="source-id",
+        checkpoint={"existing": "checkpoint"},
+    )
+
+    assert ctx.sync_run_id == "sync-run-id"
+    assert ctx.source_id == "source-id"
+    assert ctx.checkpoint == {"existing": "checkpoint"}
+    assert ctx.documents_emitted == 0
+    assert ctx.documents_scanned == 0
+    assert ctx.content_storage is not None
+
+
+@pytest.mark.asyncio
+async def test_multiple_emits_increment_counter(sdk_client, mock_connector_manager):
+    """Verify document counter increments correctly."""
+    ctx = SyncContext(
+        sdk_client=sdk_client,
+        sync_run_id="sync-123",
+        source_id="source-456",
+    )
+
+    doc = Document(external_id="doc", title="Doc", content_id="c")
+
+    await ctx.emit(doc)
+    assert ctx.documents_emitted == 1
+
+    await ctx.emit(doc)
+    assert ctx.documents_emitted == 2
+
+    await ctx.emit_updated(doc)
+    assert ctx.documents_emitted == 3
+
+    # emit_deleted does NOT increment documents_emitted
+    await ctx.emit_deleted("old-doc")
+    assert ctx.documents_emitted == 3
+
+
+class TestShouldIndexUser:
+    def _make_ctx(
+        self,
+        mode: UserFilterMode = UserFilterMode.ALL,
+        whitelist: list[str] | None = None,
+        blacklist: list[str] | None = None,
+    ) -> SyncContext:
+        class MockClient:
+            base_url = "http://test"
+
+        return SyncContext(
+            sdk_client=MockClient(),  # type: ignore
+            sync_run_id="sync-123",
+            source_id="source-456",
+            user_filter_mode=mode,
+            user_whitelist=whitelist,
+            user_blacklist=blacklist,
+        )
+
+    def test_all_mode_indexes_everyone(self):
+        ctx = self._make_ctx(UserFilterMode.ALL)
+        assert ctx.should_index_user("alice@example.com") is True
+        assert ctx.should_index_user("bob@example.com") is True
+
+    def test_whitelist_mode_includes_only_listed(self):
+        ctx = self._make_ctx(
+            UserFilterMode.WHITELIST,
+            whitelist=["alice@example.com", "bob@example.com"],
+        )
+        assert ctx.should_index_user("alice@example.com") is True
+        assert ctx.should_index_user("bob@example.com") is True
+        assert ctx.should_index_user("charlie@example.com") is False
+
+    def test_blacklist_mode_excludes_listed(self):
+        ctx = self._make_ctx(
+            UserFilterMode.BLACKLIST,
+            blacklist=["alice@example.com"],
+        )
+        assert ctx.should_index_user("alice@example.com") is False
+        assert ctx.should_index_user("bob@example.com") is True
+
+    def test_case_insensitive(self):
+        ctx = self._make_ctx(
+            UserFilterMode.WHITELIST,
+            whitelist=["Alice@Example.COM"],
+        )
+        assert ctx.should_index_user("alice@example.com") is True
+        assert ctx.should_index_user("ALICE@EXAMPLE.COM") is True
+
+    def test_empty_email_excluded_when_filtering(self):
+        ctx = self._make_ctx(
+            UserFilterMode.WHITELIST,
+            whitelist=["alice@example.com"],
+        )
+        assert ctx.should_index_user("") is False
+
+    def test_defaults_to_all_when_no_filter_specified(self):
+        ctx = self._make_ctx()
+        assert ctx.should_index_user("anyone@example.com") is True
+
+@pytest.mark.asyncio
+async def test_emit_person_sync_serializes_canonical_event(sdk_client, mock_connector_manager):
+    ctx = SyncContext(sdk_client=sdk_client, sync_run_id="run-1", source_id="source-1")
+    await ctx.emit_person_sync(PersonSyncRecord(external_id="E1", email="ada@example.com"))
+    await ctx.emit_person_deleted("grace@example.com")
+    await ctx.flush()
+    payload = json.loads(mock_connector_manager.calls[-1].request.content)
+    assert payload["events"] == [
+        {
+            "type": "person_sync",
+            "sync_run_id": "run-1",
+            "source_id": "source-1",
+            "person": {"external_id": "E1", "email": "ada@example.com"},
+        },
+        {
+            "type": "person_deleted",
+            "sync_run_id": "run-1",
+            "source_id": "source-1",
+            "email": "grace@example.com",
+        },
+    ]

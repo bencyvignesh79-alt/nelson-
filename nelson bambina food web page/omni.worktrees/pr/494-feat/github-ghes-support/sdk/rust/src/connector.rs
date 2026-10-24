@@ -1,0 +1,215 @@
+use std::collections::HashMap;
+use std::result::Result as StdResult;
+
+use crate::context::SyncContext;
+use crate::mcp_adapter::McpServer;
+use crate::models::OAuthManifestConfig;
+use crate::models::{ActionResponse, McpCredentials};
+use anyhow::Result;
+use async_trait::async_trait;
+use axum::http::StatusCode;
+use axum::response::Response;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use serde_json::Value as JsonValue;
+use shared::models::{
+    ActionDefinition, ConnectorManifest, ConnectorSkillDefinition, IntegrationType,
+    OAuthCredentialValidationRequest, OAuthCredentialValidationResponse, SearchOperator,
+    ServiceCredential, Source, SourceType, SyncType,
+};
+
+#[derive(Debug, Clone)]
+pub enum SyncRequestValidationError {
+    Unavailable(String),
+    BadRequest(String),
+}
+
+#[async_trait]
+pub trait Connector: Send + Sync + 'static {
+    /// Shape of `source.config`. Used by the SDK to validate the config blob
+    /// at `/sync` dispatch — a decode failure rejects the request with 400
+    /// before any sync run is recorded. The decoded value is discarded; the
+    /// connector receives the full `Source` and decodes its own typed view
+    /// inside `sync()` if it needs one. Use `serde_json::Value` for connectors
+    /// that don't want validation.
+    type Config: DeserializeOwned + Send + 'static;
+    /// Shape of `service_credentials.credentials`. Validated the same way as
+    /// `Config` — see above. Use `serde_json::Value` to opt out.
+    type Credentials: DeserializeOwned + Send + 'static;
+    type State: DeserializeOwned + Serialize + Send + 'static;
+
+    fn name(&self) -> &'static str;
+    fn version(&self) -> &'static str;
+    fn source_types(&self) -> Vec<SourceType>;
+
+    fn display_name(&self) -> String {
+        self.name().to_string()
+    }
+
+    fn description(&self) -> Option<String> {
+        None
+    }
+
+    fn sync_modes(&self) -> Vec<SyncType> {
+        vec![SyncType::Full]
+    }
+
+    fn actions(&self) -> Vec<ActionDefinition> {
+        vec![]
+    }
+
+    fn search_operators(&self) -> Vec<SearchOperator> {
+        vec![]
+    }
+
+    fn skills(&self) -> Vec<ConnectorSkillDefinition> {
+        vec![]
+    }
+
+    fn read_only(&self) -> bool {
+        false
+    }
+
+    fn requires_credentials(&self) -> bool {
+        true
+    }
+
+    fn extra_schema(&self) -> Option<JsonValue> {
+        None
+    }
+
+    fn attributes_schema(&self) -> Option<JsonValue> {
+        None
+    }
+
+    /// Return MCP server config (stdio or Streamable HTTP) to enable MCP
+    /// support. Returning `None` (the default) disables MCP for this connector.
+    fn mcp_server(&self) -> Option<McpServer> {
+        None
+    }
+
+    /// Return env vars for a stdio MCP subprocess. Used only when
+    /// `mcp_server()` returns `Some(McpServer::Stdio(_))`. The `credentials`
+    /// argument is the wire-format wrapper forwarded by the connector-manager
+    /// (`{credentials, config, principal_email}`). Connectors typically
+    /// deserialize `credentials.credentials` into their own typed struct.
+    async fn prepare_mcp_env(
+        &self,
+        _credentials: &McpCredentials,
+    ) -> Result<HashMap<String, String>> {
+        Ok(HashMap::new())
+    }
+
+    /// Return HTTP headers for a remote MCP server. Used only when
+    /// `mcp_server()` returns `Some(McpServer::Http(_))`.
+    async fn prepare_mcp_headers(
+        &self,
+        _credentials: &McpCredentials,
+    ) -> Result<HashMap<String, String>> {
+        Ok(HashMap::new())
+    }
+
+    /// Declarative OAuth2 config consumed by the web app's generic OAuth
+    /// service. Override on connectors that authenticate via OAuth; the
+    /// default returns `None` for connectors that use service accounts,
+    /// API keys, or other auth schemes.
+    fn oauth_config(&self) -> Option<OAuthManifestConfig> {
+        None
+    }
+
+    /// Recognize terminal authentication failures surfaced by the MCP server
+    /// or its launcher that require the acting user's OAuth reconnection.
+    /// Connectors with provider-specific authentication errors can override
+    /// this without exposing credentials in an HTTP response; failures that
+    /// carry the generic auth-status marker are already recognized by the
+    /// SDK and do not need this hook.
+    fn mcp_authentication_error(&self, _message: &str) -> bool {
+        false
+    }
+
+    /// Validate a freshly exchanged OAuth credential before it is persisted.
+    /// Connectors may reject credentials that are valid at the provider but
+    /// belong to a different source organization by returning an error, and
+    /// may return a source binding (e.g. a provider organization identifier)
+    /// that the caller stores under the reserved `source_binding` config key.
+    /// The default accepts the credential without binding anything.
+    async fn validate_oauth_credential(
+        &self,
+        _request: &OAuthCredentialValidationRequest,
+    ) -> Result<OAuthCredentialValidationResponse> {
+        Ok(OAuthCredentialValidationResponse::default())
+    }
+
+    /// Connector-specific gate run before the SDK reserves a sync slot or
+    /// starts `sync()`. Use this for request-level availability checks, such as
+    /// optional realtime prerequisites that should return 404 instead of
+    /// starting and recording a failed sync run.
+    async fn validate_sync_request(
+        &self,
+        _source: &Source,
+        _credentials: Option<&ServiceCredential>,
+        _sync_type: SyncType,
+    ) -> StdResult<(), SyncRequestValidationError> {
+        Ok(())
+    }
+
+    async fn sync(
+        &self,
+        source: Source,
+        credentials: Option<ServiceCredential>,
+        state: Option<Self::State>,
+        ctx: SyncContext,
+    ) -> Result<()>;
+
+    async fn cancel(&self, _sync_run_id: &str) -> bool {
+        false
+    }
+
+    async fn execute_action(
+        &self,
+        action: &str,
+        _params: JsonValue,
+        _credentials: Option<ServiceCredential>,
+        _source: Option<Source>,
+        _actor_email: Option<String>,
+    ) -> Result<Response> {
+        Ok(ActionResponse::not_supported(action).into_response_with_status(StatusCode::NOT_FOUND))
+    }
+
+    /// Build the connector's static manifest (its name, version, manually-defined
+    /// actions, search operators, etc.). When `mcp_server()` is `Some`, the SDK's
+    /// `/manifest` handler additionally layers MCP-discovered tools, resources,
+    /// and prompts on top of the value returned here — connectors don't need to
+    /// override this method to surface MCP data.
+    async fn build_manifest(&self, connector_url: String) -> ConnectorManifest {
+        ConnectorManifest {
+            name: self.name().to_string(),
+            display_name: self.display_name(),
+            version: self.version().to_string(),
+            sync_modes: self.sync_modes(),
+            connector_id: self.name().to_string(),
+            connector_url,
+            integration_type: IntegrationType::Connector,
+            source_types: self
+                .source_types()
+                .into_iter()
+                .map(|source_type| source_type.to_string())
+                .collect(),
+            description: self.description(),
+            actions: self.actions(),
+            search_operators: self.search_operators(),
+            read_only: self.read_only(),
+            extra_schema: self.extra_schema(),
+            attributes_schema: self.attributes_schema(),
+            mcp_enabled: self.mcp_server().is_some(),
+            mcp_catalog_loaded: false,
+            resources: vec![],
+            prompts: vec![],
+            skills: self.skills(),
+            source_capabilities: vec![],
+            oauth: self
+                .oauth_config()
+                .and_then(|c| serde_json::to_value(c).ok()),
+        }
+    }
+}
