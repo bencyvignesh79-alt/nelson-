@@ -1,0 +1,15 @@
+.git
+**/.git
+.venv
+**/.venv
+venv
+**/venv
+__pycache__
+**/__pycache__
+*.py[cod]
+.env
+**/.env
+nelson bambina food web page/Ai auto_learn/
+nelson bambina food web page/Ai speak model/
+nelson bambina food web page/omni/
+nelson bambina food web page/omni.worktrees/

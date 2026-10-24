@@ -40,6 +40,9 @@ databases, machines, or other MCP servers.
 
 ## Security and deployment notes
 
+- The repository-root `Dockerfile` builds this app when the deployment service
+  uses the repository root as its build context. Set `GEMINI_API_KEY` in the
+  deployment platform's environment settings; do not add `.env` to the image.
 - The Gemini key is read only by the Python process. Never expose it in
   browser JavaScript or a public repository.
 - `.env` is ignored by Git; `.env.example` contains placeholders only.
