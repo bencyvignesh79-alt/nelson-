@@ -9,7 +9,7 @@ COPY ["nelson bambina food web page/requirements.txt", "./requirements.txt"]
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY ["nelson bambina food web page/bft_ai", "./bft_ai"]
-COPY ["nelson bambina food web page/BFT Nelson.html", "./BFT Nelson.html"]
+COPY ["nelson bambina food web page/BFT.html", "./BFT Nelson.html"]
 
 EXPOSE 8000
 
