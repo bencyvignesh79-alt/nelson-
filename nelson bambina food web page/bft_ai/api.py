@@ -77,7 +77,9 @@ def _check_rate_limit(client_id: str, now: float) -> bool:
 
 @app.get("/", include_in_schema=False)
 def website() -> FileResponse:
-    return FileResponse(PROJECT_ROOT / "BFT Nelson.html")
+    deployed_page = PROJECT_ROOT / "BFT Nelson.html"
+    local_page = PROJECT_ROOT / "BFT.html"
+    return FileResponse(deployed_page if deployed_page.is_file() else local_page)
 
 
 @app.post("/api/v1/ai/chat", response_model=ChatResponse)

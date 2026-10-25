@@ -34,7 +34,7 @@ def generate_reply(question: str) -> str:
     if not api_key:
         raise GeminiNotConfiguredError("Gemini is not configured on this server.")
 
-    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+    model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
     if not model:
         raise GeminiNotConfiguredError("GEMINI_MODEL must not be empty.")
 

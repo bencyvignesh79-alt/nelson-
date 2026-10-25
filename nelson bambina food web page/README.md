@@ -10,8 +10,8 @@ visitors are warned not to include personal or confidential information.
 
 1. Create a Google Gemini API key in Google AI Studio. Do not paste it into the
    HTML, source control, chat, or `.vscode/mcp.json`.
-2. Add the key to the ignored root `.env` file as `GEMINI_API_KEY=...`.
-   `GEMINI_MODEL` is optional and defaults to `gemini-2.5-flash`. The existing
+2. Add the key to the ignored root `.F` file as `GEMINI_API_KEY=...`.
+   `GEMINI_MODEL` is optional and defaults to `gemini-3.8-flash`. The existing
    `vbs` environment entry is separate and is not read by this integration.
 3. From the project root, create an environment and install the dependencies:
 
