@@ -10,7 +10,8 @@ visitors are warned not to include personal or confidential information.
 
 1. Create a Google Gemini API key in Google AI Studio. Do not paste it into the
    HTML, source control, chat, or `.vscode/mcp.json`.
-2. Add the key to the ignored root `.F` file as `GEMINI_API_KEY=...`.
+2. Copy `.env.example` to `.env` if needed, then add the key to the ignored root
+   `.env` file as `GEMINI_API_KEY=...`.
    `GEMINI_MODEL` is optional and defaults to `gemini-3.8-flash`. The existing
    `vbs` environment entry is separate and is not read by this integration.
 3. From the project root, create an environment and install the dependencies:
@@ -37,6 +38,13 @@ controls. VS Code asks for the Gemini key through a password-masked input; the
 key is passed to the local MCP process and is not written into the JSON file.
 The MCP tool accepts only a question and has no tools for accessing files,
 databases, machines, or other MCP servers.
+
+## Render deployment
+
+In the Render service's **Environment** settings, add `GEMINI_API_KEY` with a
+key created in Google AI Studio. `GEMINI_MODEL` is optional and defaults to
+`gemini-3.8-flash`. Save the settings and redeploy the service. Keep the key in
+Render's environment settings; do not put it in the HTML or commit it to Git.
 
 ## Security and deployment notes
 
